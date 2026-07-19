@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+build/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.venv/
+venv/
+
+# uv
+# uv.lock is committed — required by Dockerfile (uv sync --frozen)
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Secrets / keys
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/*.tfplan
+terraform/.terraform.lock.hcl
+
+# Docker
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/settings.local.json
+.claude/*.local.json
+
+# Linting
+.ruff_cache/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/

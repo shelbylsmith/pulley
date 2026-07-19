@@ -1,0 +1,61 @@
+# Replace YOUR-PULLEY-DOMAIN with your public HTTPS domain before pasting this
+# into api.slack.com/apps → "Create from manifest".
+display_information:
+  name: Pulley
+  description: GitHub ↔ Slack PR integration — ephemeral channels, review sync, CI/CD notifications
+  background_color: "#1a1a2e"
+
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: Pulley
+    always_online: true
+  slash_commands:
+    - command: /lgtm
+      url: https://YOUR-PULLEY-DOMAIN/slack/commands/lgtm
+      description: Approve the pull request linked to this channel
+      usage_hint: "[optional comment]"
+      should_escape: false
+    - command: /pulley
+      url: https://YOUR-PULLEY-DOMAIN/slack/commands/pulley
+      description: Pulley PR commands
+      usage_hint: "open | me | team <name> | merge [method]"
+      should_escape: true
+
+oauth_config:
+  redirect_urls:
+    - https://YOUR-PULLEY-DOMAIN/auth/slack/callback
+  scopes:
+    bot:
+      - channels:manage
+      - channels:history
+      - channels:read
+      - chat:write
+      - chat:write.customize
+      - chat:write.public
+      - commands
+      - groups:write
+      - reactions:read
+      - reactions:write
+      - users:read
+      - users:read.email
+      - bookmarks:write
+    user:
+      - chat:write
+      - users:read
+
+settings:
+  event_subscriptions:
+    request_url: https://YOUR-PULLEY-DOMAIN/slack/events
+    bot_events:
+      - app_home_opened
+      - message.channels
+      - reaction_added
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
