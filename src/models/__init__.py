@@ -4,6 +4,7 @@ from src.models.pull_request import PullRequest
 from src.models.review_time_slot import ReviewTimeSlot
 from src.models.scheduler_run import SchedulerRun
 from src.models.slack_channel import SlackChannel
+from src.models.slack_event_claim import SlackEventClaim
 from src.models.thread_mapping import ThreadMapping
 from src.models.user import User
 
@@ -16,4 +17,5 @@ __all__ = [
     "ThreadMapping",
     "MessageMapping",
     "SchedulerRun",
+    "SlackEventClaim",
 ]

@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -13,6 +13,7 @@ from src.models.organization import Organization
 from src.models.pull_request import PullRequest
 from src.models.scheduler_run import SchedulerRun
 from src.models.slack_channel import SlackChannel
+from src.models.slack_event_claim import SlackEventClaim
 from src.models.thread_mapping import ThreadMapping
 from src.models.user import User
 
@@ -798,3 +799,30 @@ async def claim_scheduled_run(job_name: str, scheduled_for: datetime) -> bool:
         )
         await s.commit()
         return result.rowcount == 1
+
+
+# ── Slack event dedupe ────────────────────────────────────
+
+
+async def claim_slack_event(event_id: str) -> bool:
+    """Claim a Slack event delivery, returning True iff we won the race.
+
+    Slack redelivers events that aren't acked within 3 seconds, so the same
+    event_id can arrive multiple times, including while the original delivery
+    is still processing. Only the claim winner processes the event.
+    """
+    async with _session() as s:
+        result = await s.execute(
+            pg_insert(SlackEventClaim)
+            .values(event_id=event_id)
+            .on_conflict_do_nothing(constraint="uq_slack_event_claims_event_id")
+        )
+        await s.commit()
+        return result.rowcount == 1
+
+
+async def release_slack_event(event_id: str) -> None:
+    """Release a claim after failed processing so a Slack retry can rescue it."""
+    async with _session() as s:
+        await s.execute(delete(SlackEventClaim).where(SlackEventClaim.event_id == event_id))
+        await s.commit()

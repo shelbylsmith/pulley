@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from src.config import settings
+from src.db.queries import claim_slack_event, release_slack_event
 from src.utils.webhook_verify import verify_slack_signature
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,20 @@ async def slack_event(request: Request):
         return {"challenge": payload["challenge"]}
 
     if payload.get("type") == "event_callback":
-        event = payload["event"]
-        await _dispatch_event(event, payload.get("team_id"))
+        event_id = payload["event_id"]
+        # Slack redelivers events not acked within 3s; the claim makes every
+        # delivery of an event_id beyond the first a no-op, even one racing an
+        # original that is still processing.
+        if not await claim_slack_event(event_id):
+            logger.info("Skipping duplicate Slack delivery event_id=%s", event_id)
+            return {"ok": True}
+        try:
+            await _dispatch_event(payload["event"], payload.get("team_id"))
+        except Exception:
+            # Give the event back: a genuine failure here should be rescued by
+            # Slack's next retry instead of being swallowed by the claim.
+            await release_slack_event(event_id)
+            raise
 
     return {"ok": True}
 

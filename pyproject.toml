@@ -1,6 +1,6 @@
 [project]
 name = "pulley"
-version = "0.1.0"
+version = "0.1.1"
 description = "Bidirectional GitHub-Slack PR integration — ephemeral channels, review sync, CI/CD notifications"
 readme = "README.md"
 requires-python = ">=3.12"
