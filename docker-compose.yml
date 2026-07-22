@@ -14,17 +14,6 @@ services:
       timeout: 3s
       retries: 5
 
-  migrate:
-    image: ${PULLEY_IMAGE:-ghcr.io/shelbylsmith/pulley:latest}
-    command: ["alembic", "upgrade", "head"]
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://pulley:${POSTGRES_PASSWORD:-pulley}@db:5432/pulley
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: "no"
-
   app:
     image: ${PULLEY_IMAGE:-ghcr.io/shelbylsmith/pulley:latest}
     restart: unless-stopped
@@ -37,8 +26,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
 
 volumes:
   pgdata:
