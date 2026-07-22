@@ -47,6 +47,10 @@ class PullRequest(Base):
     last_review_state: Mapped[str | None] = mapped_column(String(32))
     # Comma-separated GitHub usernames of currently-requested reviewers.
     reviewers: Mapped[str | None] = mapped_column(Text)
+    # When the current pending review request was opened — set when the PR
+    # gains its first pending reviewer, kept as more are added, cleared when
+    # none remain (everyone submitted or was removed).
+    review_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

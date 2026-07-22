@@ -268,7 +268,7 @@ async def test_issue_comment_deleted_removes_all_chunks():
 async def test_review_dismissed_posts_message_and_clears_state():
     payload = {
         "review": {"user": {"login": "octo"}, "html_url": "https://gh/r"},
-        "pull_request": {"number": 5},
+        "pull_request": {"id": 99, "number": 5, "requested_reviewers": []},
         "repository": {"full_name": "org/repo"},
         "sender": {"login": "maintainer"},
     }
@@ -279,6 +279,7 @@ async def test_review_dismissed_posts_message_and_clears_state():
         patch.object(sync_service, "get_org", new=AsyncMock(return_value=org)),
         patch.object(sync_service.slack_service, "post_message", new=AsyncMock()) as post,
         patch.object(sync_service, "set_pr_last_review_state", new=AsyncMock()) as set_state,
+        patch.object(sync_service, "set_pr_reviewers", new=AsyncMock()) as set_reviewers,
         patch.object(sync_service.pr_digest_service, "update", new=AsyncMock()) as digest,
     ):
         await sync_service.handle_pr_review_dismissed(payload)
@@ -288,19 +289,85 @@ async def test_review_dismissed_posts_message_and_clears_state():
     assert "maintainer" in message and "octo" in message
     assert "<https://gh/r|org/repo#5>" in message
     set_state.assert_awaited_once_with(99, None)
+    set_reviewers.assert_awaited_once_with(99, [])
     digest.assert_awaited_once_with(99, org)
 
 
 async def test_review_dismissed_skips_untracked_pr():
     payload = {
         "review": {"user": {"login": "octo"}, "html_url": "https://gh/r"},
-        "pull_request": {"number": 5},
+        "pull_request": {"id": 99, "number": 5, "requested_reviewers": []},
         "repository": {"full_name": "org/repo"},
         "sender": {"login": "maintainer"},
     }
     with (
         patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=None)),
+        patch.object(sync_service, "set_pr_reviewers", new=AsyncMock()),
         patch.object(sync_service.slack_service, "post_message", new=AsyncMock()) as post,
     ):
         await sync_service.handle_pr_review_dismissed(payload)
     post.assert_not_called()
+
+
+# ── Review submitted: pending-reviewer sync ───────────────
+
+
+async def test_review_submit_syncs_pending_reviewers():
+    """Submitting a review must persist the payload's requested_reviewers so
+    the pending-review clock stops once nobody is left."""
+    payload = {
+        "review": {"id": 1, "user": {"login": "alice"}, "state": "approved", "body": ""},
+        "pull_request": {
+            "id": 99,
+            "number": 5,
+            "requested_reviewers": [{"login": "bob"}],
+        },
+        "repository": {"full_name": "org/repo"},
+    }
+    with (
+        patch.object(sync_service, "set_pr_reviewers", new=AsyncMock()) as set_reviewers,
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=None)),
+    ):
+        await sync_service.handle_pr_review(payload)
+    set_reviewers.assert_awaited_once_with(99, ["bob"])
+
+
+async def test_review_submit_drops_submitter_from_stale_payload():
+    """If the embedded PR object still lists the submitter, filter them out."""
+    payload = {
+        "review": {"id": 1, "user": {"login": "alice"}, "state": "approved", "body": ""},
+        "pull_request": {
+            "id": 99,
+            "number": 5,
+            "requested_reviewers": [{"login": "alice"}, {"login": "bob"}],
+        },
+        "repository": {"full_name": "org/repo"},
+    }
+    with (
+        patch.object(sync_service, "set_pr_reviewers", new=AsyncMock()) as set_reviewers,
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=None)),
+    ):
+        await sync_service.handle_pr_review(payload)
+    set_reviewers.assert_awaited_once_with(99, ["bob"])
+
+
+async def test_review_submit_syncs_reviewers_even_for_sync_tagged_body():
+    """Echo-guarded reviews still clear the pending request — the early return
+    only suppresses the Slack message."""
+    payload = {
+        "review": {
+            "id": 1,
+            "user": {"login": "alice"},
+            "state": "approved",
+            "body": f"lgtm\n\n{sync_service.SYNC_TAG}",
+        },
+        "pull_request": {"id": 99, "number": 5, "requested_reviewers": []},
+        "repository": {"full_name": "org/repo"},
+    }
+    with (
+        patch.object(sync_service, "set_pr_reviewers", new=AsyncMock()) as set_reviewers,
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock()) as get_pr,
+    ):
+        await sync_service.handle_pr_review(payload)
+    set_reviewers.assert_awaited_once_with(99, [])
+    get_pr.assert_not_called()

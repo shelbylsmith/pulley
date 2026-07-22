@@ -540,6 +540,22 @@ async def get_user_by_github_username(github_username: str) -> User | None:
         return result.scalar_one_or_none()
 
 
+def _next_review_requested_at(
+    previously_pending: bool,
+    usernames: list[str],
+    current: datetime | None,
+    now: datetime,
+) -> datetime | None:
+    """Pending-review clock: starts when the first reviewer is requested,
+    survives additional requests while pending, and is cancelled once nobody
+    is pending (everyone submitted or was removed)."""
+    if not usernames:
+        return None
+    if not previously_pending:
+        return now
+    return current
+
+
 async def set_pr_reviewers(github_pr_id: int, usernames: list[str]) -> PullRequest | None:
     async with _session() as s:
         result = await s.execute(
@@ -547,10 +563,24 @@ async def set_pr_reviewers(github_pr_id: int, usernames: list[str]) -> PullReque
         )
         pr = result.scalar_one_or_none()
         if pr:
+            pr.review_requested_at = _next_review_requested_at(
+                bool(pr.reviewers), usernames, pr.review_requested_at, datetime.now(UTC)
+            )
             pr.reviewers = ",".join(usernames) if usernames else None
             await s.commit()
             await s.refresh(pr)
         return pr
+
+
+async def set_pr_review_requested_at(pr_id: int, requested_at: datetime) -> None:
+    """Backfill the pending-review clock for rows that predate the column."""
+    async with _session() as s:
+        await s.execute(
+            update(PullRequest)
+            .where(PullRequest.id == pr_id)
+            .values(review_requested_at=requested_at)
+        )
+        await s.commit()
 
 
 async def set_pr_title(github_pr_id: int, title: str) -> PullRequest | None:
