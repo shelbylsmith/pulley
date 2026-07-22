@@ -29,6 +29,7 @@ from src.db.queries import (
     get_user_by_slack_id,
     set_message_mapping_extra_ts,
     set_pr_last_review_state,
+    set_pr_reviewers,
 )
 from src.services import pr_digest_service, slack_service
 from src.services.github_service import (
@@ -123,6 +124,16 @@ async def handle_pr_review(payload: dict) -> None:
     pr = payload["pull_request"]
     repo = payload["repository"]["full_name"]
     pr_number = pr["number"]
+    reviewer = review["user"]["login"]
+
+    # Submitting a review removes the submitter from requested_reviewers, and
+    # the payload's PR object already reflects that — sync it (filtering the
+    # submitter defensively in case the embedded object is stale) so the
+    # pending-review clock stops when nobody is left pending.
+    await set_pr_reviewers(
+        pr["id"],
+        [r["login"] for r in pr.get("requested_reviewers", []) if r["login"] != reviewer],
+    )
 
     body = review.get("body") or ""
     if SYNC_TAG in body:
@@ -143,7 +154,6 @@ async def handle_pr_review(payload: dict) -> None:
     org = await get_org(db_pr.organization_id)
     token = org.slack_bot_token if org else None
 
-    reviewer = review["user"]["login"]
     review_url = review["html_url"]
 
     body_slack = await _github_body_to_slack(body) if body else ""
@@ -183,6 +193,10 @@ async def handle_pr_review_dismissed(payload: dict) -> None:
     pr = payload["pull_request"]
     repo = payload["repository"]["full_name"]
     pr_number = pr["number"]
+
+    # Dismissal doesn't re-open the review request, but the payload carries
+    # the current pending set — keep the stored column in sync.
+    await set_pr_reviewers(pr["id"], [r["login"] for r in pr.get("requested_reviewers", [])])
 
     db_pr = await get_pr_by_repo_and_number(repo, pr_number)
     if not db_pr or not db_pr.slack_channel_id:

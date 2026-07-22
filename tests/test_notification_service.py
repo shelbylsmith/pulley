@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -100,3 +101,139 @@ async def test_check_suite_alerts_on_manual_dispatch():
         finally:
             patch.stopall()
         post.assert_called_once()
+
+
+# ── Stale PR reminders ────────────────────────────────────
+
+
+def _open_pr(number=194, requested=("alice",), draft=False):
+    return {
+        "number": number,
+        "draft": draft,
+        "requested_reviewers": [{"login": login} for login in requested],
+        "html_url": f"https://github.com/acme/example-repo/pull/{number}",
+    }
+
+
+def _reminder_patches(prs, db_pr, slack_ids=()):
+    # send_stale_pr_reminders imports get_open_pulls at call time, so patch it
+    # on the github_service module itself.
+    return [
+        patch.object(
+            notification_service.github_service,
+            "get_open_pulls",
+            new=AsyncMock(return_value=prs),
+        ),
+        patch.object(
+            notification_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=db_pr)
+        ),
+        patch.object(notification_service, "set_pr_review_requested_at", new=AsyncMock()),
+        patch.object(
+            notification_service,
+            "get_slack_ids_for_github_usernames",
+            new=AsyncMock(return_value=list(slack_ids)),
+        ),
+    ]
+
+
+async def _run_reminders():
+    await notification_service.send_stale_pr_reminders(42, ["acme/example-repo"], "xoxb")
+
+
+async def test_stale_reminder_posts_for_aged_pending_request():
+    db_pr = SimpleNamespace(
+        id=7,
+        slack_channel_id="C9",
+        review_requested_at=datetime.now(UTC) - timedelta(hours=30),
+    )
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _reminder_patches([_open_pr()], db_pr):
+            p.start()
+        try:
+            await _run_reminders()
+        finally:
+            patch.stopall()
+        post.assert_called_once()
+        message = post.call_args.args[1]
+        assert "30h" in message
+        assert "alice" in message
+
+
+async def test_stale_reminder_mentions_linked_reviewer():
+    db_pr = SimpleNamespace(
+        id=7,
+        slack_channel_id="C9",
+        review_requested_at=datetime.now(UTC) - timedelta(hours=48),
+    )
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _reminder_patches([_open_pr()], db_pr, slack_ids=["U123"]):
+            p.start()
+        try:
+            await _run_reminders()
+        finally:
+            patch.stopall()
+        assert "<@U123>" in post.call_args.args[1]
+
+
+async def test_stale_reminder_silent_when_nobody_pending():
+    """No requested reviewers → no clock, no nag — however old the PR is."""
+    db_pr = SimpleNamespace(
+        id=7,
+        slack_channel_id="C9",
+        review_requested_at=datetime.now(UTC) - timedelta(hours=300),
+    )
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _reminder_patches([_open_pr(requested=())], db_pr):
+            p.start()
+        try:
+            await _run_reminders()
+        finally:
+            patch.stopall()
+        post.assert_not_called()
+
+
+async def test_stale_reminder_waits_out_fresh_request():
+    db_pr = SimpleNamespace(
+        id=7,
+        slack_channel_id="C9",
+        review_requested_at=datetime.now(UTC) - timedelta(hours=2),
+    )
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _reminder_patches([_open_pr()], db_pr):
+            p.start()
+        try:
+            await _run_reminders()
+        finally:
+            patch.stopall()
+        post.assert_not_called()
+
+
+async def test_stale_reminder_backfills_missing_clock():
+    """Rows that predate the column get stamped now instead of reminded."""
+    db_pr = SimpleNamespace(id=7, slack_channel_id="C9", review_requested_at=None)
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _reminder_patches([_open_pr()], db_pr):
+            p.start()
+        try:
+            await _run_reminders()
+            notification_service.set_pr_review_requested_at.assert_awaited_once()
+            assert notification_service.set_pr_review_requested_at.await_args.args[0] == 7
+        finally:
+            patch.stopall()
+        post.assert_not_called()
+
+
+async def test_stale_reminder_skips_drafts():
+    db_pr = SimpleNamespace(
+        id=7,
+        slack_channel_id="C9",
+        review_requested_at=datetime.now(UTC) - timedelta(hours=100),
+    )
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _reminder_patches([_open_pr(draft=True)], db_pr):
+            p.start()
+        try:
+            await _run_reminders()
+        finally:
+            patch.stopall()
+        post.assert_not_called()

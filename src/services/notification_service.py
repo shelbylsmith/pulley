@@ -12,6 +12,7 @@ from src.db.queries import (
     get_pr_by_repo_and_number,
     get_slack_ids_for_github_usernames,
     set_pr_ci_bookmark_id,
+    set_pr_review_requested_at,
     transition_pr_last_ci_state,
 )
 from src.services import github_service, slack_service
@@ -511,7 +512,7 @@ async def send_stale_pr_reminders(
     repos: list[str],
     bot_token: str,
 ) -> None:
-    from src.services.github_service import get_open_pulls, get_pull_request_reviews
+    from src.services.github_service import get_open_pulls
 
     now = datetime.now(UTC)
 
@@ -521,44 +522,40 @@ async def send_stale_pr_reminders(
             if pr.get("draft"):
                 continue
 
-            updated = datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00"))
-            hours_since_update = (now - updated).total_seconds() / 3600
-
-            if hours_since_update < 24:
+            # GitHub drops a reviewer from requested_reviewers the moment they
+            # submit and re-adds them on re-request, so this is the live
+            # pending set — no review fetching needed.
+            pending = [r["login"] for r in pr.get("requested_reviewers", [])]
+            if not pending:
                 continue
-
-            reviews = await get_pull_request_reviews(installation_id, repo, pr["number"])
-            if reviews:
-                latest_per_reviewer: dict[str, dict] = {}
-                for r in sorted(reviews, key=lambda r: r.get("submitted_at", "")):
-                    if r.get("state") == "COMMENTED":
-                        continue
-                    user = (r.get("user") or {}).get("login")
-                    if user:
-                        latest_per_reviewer[user] = r
-                decisions = {r["state"] for r in latest_per_reviewer.values()}
-                if "CHANGES_REQUESTED" not in decisions and "APPROVED" in decisions:
-                    continue
-
-                latest_review = max(reviews, key=lambda r: r.get("submitted_at", ""))
-                review_time = datetime.fromisoformat(
-                    latest_review["submitted_at"].replace("Z", "+00:00")
-                )
-                if (now - review_time).total_seconds() / 3600 < 24:
-                    continue
 
             db_pr = await get_pr_by_repo_and_number(repo, pr["number"])
             if not db_pr or not db_pr.slack_channel_id:
                 continue
 
-            hours = int(hours_since_update)
+            if db_pr.review_requested_at is None:
+                # Row predates the pending-review clock; start it now and
+                # remind on a later run once it has actually aged.
+                await set_pr_review_requested_at(db_pr.id, now)
+                continue
+
+            hours_pending = (now - db_pr.review_requested_at).total_seconds() / 3600
+            if hours_pending < 24:
+                continue
+
+            labels = []
+            for login in pending:
+                mention = await _mention_for_github_login(login)
+                labels.append(mention or f"*{login}*")
+
+            hours = int(hours_pending)
             await slack_service.post_message(
                 db_pr.slack_channel_id,
-                f"⏰ This PR hasn't been reviewed in {hours}h. Reviewers: please take a look!",
+                f"⏰ Review requested {hours}h ago — still waiting on {', '.join(labels)}.",
                 token=bot_token,
             )
             logger.info(
-                "Sent stale reminder for %s#%d (%dh)",
+                "Sent stale reminder for %s#%d (%dh pending)",
                 repo,
                 pr["number"],
                 hours,
