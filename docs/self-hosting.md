@@ -53,9 +53,9 @@ Start everything:
 docker compose up -d
 ```
 
-Compose brings up Postgres, runs the one-shot `migrate` service
-(`alembic upgrade head`), and starts the app on `127.0.0.1:8000` with the in-app
-scheduler enabled.
+Compose brings up Postgres and starts the app on `127.0.0.1:8000` with the
+in-app scheduler enabled. The app applies migrations (`alembic upgrade head`)
+on startup, before it begins serving.
 
 Check it's healthy (the app binds to loopback, so query it locally on the host):
 
@@ -152,8 +152,8 @@ absorbs duplicates, so overlapping crons or retries won't double-post.
 docker compose pull && docker compose up -d
 ```
 
-Pulling a new image and running `up` re-runs the `migrate` service, so schema
-migrations are applied automatically before the app starts.
+The app container applies schema migrations on startup, before it begins
+serving — pulling a new image and running `up` is the whole upgrade.
 
 For predictable upgrades, pin a semver tag instead of `latest` in your
 `docker-compose.yml` (e.g. `ghcr.io/shelbylsmith/pulley:1.2.0`) and bump it

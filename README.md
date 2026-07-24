@@ -161,8 +161,9 @@ In any Slack channel where the bot is a member:
 ### Docker Compose (primary)
 
 The included `docker-compose.yml` is the supported path: it runs Postgres 16 (no
-public port), a one-shot `migrate` service that runs `alembic upgrade head`, and
-the app bound to `127.0.0.1:8000` with `SCHEDULER_ENABLED=true`. Front it with a
+public port) and the app bound to `127.0.0.1:8000` with `SCHEDULER_ENABLED=true`.
+The app container applies migrations (`alembic upgrade head`) on startup, before
+serving; concurrent starts serialize on a Postgres advisory lock. Front it with a
 reverse proxy that terminates TLS for your domain. Full instructions —
 reverse-proxy examples, scheduling, upgrades, and backups — are in
 **[docs/self-hosting.md](docs/self-hosting.md)**.

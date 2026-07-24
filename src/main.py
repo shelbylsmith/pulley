@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.config import settings
+from src.db.migrate import upgrade_to_head
 from src.routers import auth, github_webhooks, health, internal, slack_commands, slack_events
 from src.scheduler import scheduler_loop
 
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Pulley starting up")
+    # Before serving: a failed migration must fail startup, not surface later
+    # as per-request errors against a half-migrated schema.
+    await upgrade_to_head()
+    logger.info("Database schema is at head")
     scheduler_task: asyncio.Task | None = None
     if settings.scheduler_enabled:
         if settings.internal_api_token:
