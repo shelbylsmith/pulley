@@ -100,7 +100,7 @@ async def test_issue_comment_edited_updates_slack_message():
         ),
         patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=db_pr)),
         patch.object(sync_service, "get_org", new=AsyncMock(return_value=org)),
-        patch.object(sync_service, "_github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
+        patch.object(sync_service, "github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
         patch.object(sync_service, "_update_attributed_to_github_user", new=AsyncMock()) as upd,
         patch.object(sync_service, "set_message_mapping_extra_ts", new=AsyncMock()) as set_extra,
     ):

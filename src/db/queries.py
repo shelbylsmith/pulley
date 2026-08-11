@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.db.database import async_session
+from src.models.issue import Issue
+from src.models.issue_digest_message import IssueDigestMessage
 from src.models.message_mapping import MessageMapping
 from src.models.organization import Organization
 from src.models.pr_digest_message import PRDigestMessage
@@ -497,6 +499,101 @@ async def set_pr_digest_ts(pr_id: int, channel_id: str, ts: str) -> None:
             .values(pull_request_id=pr_id, slack_channel_id=channel_id, slack_ts=ts)
             .on_conflict_do_update(
                 constraint="uq_pr_digest_pr_channel",
+                set_={"slack_ts": ts},
+            )
+        )
+        await s.commit()
+
+
+# ── Issue queries ─────────────────────────────────────────
+
+
+async def get_issue_by_github_id(github_issue_id: int) -> Issue | None:
+    async with _session() as s:
+        result = await s.execute(select(Issue).where(Issue.github_issue_id == github_issue_id))
+        return result.scalar_one_or_none()
+
+
+async def upsert_issue(
+    *,
+    organization_id: int,
+    github_issue_id: int,
+    github_issue_number: int,
+    repo_full_name: str,
+    title: str,
+    body: str | None,
+    html_url: str,
+    author_github_username: str,
+    state: str,
+    state_reason: str | None,
+    labels: str | None,
+    assignees: str | None,
+) -> Issue:
+    """Write the latest snapshot of an issue, keyed by its GitHub id.
+
+    Every `issues` webhook carries the whole issue, so each delivery overwrites
+    the row wholesale — no field-by-field setters, and no drift if we miss an
+    event. Upsert rather than insert so a redelivery, or an issue whose first
+    seen event isn't `opened`, both land on the same row.
+    """
+    values = {
+        "organization_id": organization_id,
+        "github_issue_id": github_issue_id,
+        "github_issue_number": github_issue_number,
+        "repo_full_name": repo_full_name,
+        "title": title,
+        "body": body,
+        "html_url": html_url,
+        "author_github_username": author_github_username,
+        "state": state,
+        "state_reason": state_reason,
+        "labels": labels,
+        "assignees": assignees,
+    }
+    async with _session() as s:
+        result = await s.execute(
+            pg_insert(Issue)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[Issue.github_issue_id],
+                # onupdate= only fires for ORM updates, so stamp it here too.
+                set_={**values, "updated_at": func.now()},
+            )
+            .returning(Issue)
+        )
+        issue = result.scalar_one()
+        await s.commit()
+        return issue
+
+
+async def delete_issue(issue_id: int) -> None:
+    """Drop an issue and the cards we posted for it (GitHub issue deleted)."""
+    async with _session() as s:
+        await s.execute(delete(IssueDigestMessage).where(IssueDigestMessage.issue_id == issue_id))
+        await s.execute(delete(Issue).where(Issue.id == issue_id))
+        await s.commit()
+
+
+async def get_issue_digest_ts(issue_id: int, channel_id: str) -> str | None:
+    """Return the ts of this issue's card in `channel_id`, if we posted one."""
+    async with _session() as s:
+        result = await s.execute(
+            select(IssueDigestMessage.slack_ts)
+            .where(IssueDigestMessage.issue_id == issue_id)
+            .where(IssueDigestMessage.slack_channel_id == channel_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def set_issue_digest_ts(issue_id: int, channel_id: str, ts: str) -> None:
+    """Record the ts of this issue's card in `channel_id`. Upsert for the same
+    reasons as `set_pr_digest_ts`."""
+    async with _session() as s:
+        await s.execute(
+            pg_insert(IssueDigestMessage)
+            .values(issue_id=issue_id, slack_channel_id=channel_id, slack_ts=ts)
+            .on_conflict_do_update(
+                constraint="uq_issue_digest_issue_channel",
                 set_={"slack_ts": ts},
             )
         )

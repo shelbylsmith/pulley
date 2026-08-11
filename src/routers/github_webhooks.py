@@ -73,6 +73,14 @@ async def _dispatch_event(event: str, action: str | None, payload: dict) -> None
         if action in ("resolved", "unresolved"):
             await handle_review_thread(payload, action)
 
+    elif event == "issues":
+        from src.services import issue_service
+
+        if action in issue_service.CARD_ACTIONS:
+            await issue_service.handle_issue_event(payload)
+        elif action == "deleted":
+            await issue_service.handle_issue_deleted(payload)
+
     elif event == "issue_comment":
         if action == "created":
             await handle_issue_comment(payload)

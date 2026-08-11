@@ -21,7 +21,6 @@ from src.db.queries import (
     get_org,
     get_pr_by_channel,
     get_pr_by_repo_and_number,
-    get_slack_id_map_for_github_usernames,
     get_slack_ids_for_github_usernames,
     get_thread_mapping,
     get_thread_mapping_by_slack_ts,
@@ -46,11 +45,10 @@ from src.services.github_service import (
     update_review_comment,
     update_review_comment_as_user,
 )
+from src.services.github_text import github_body_to_slack
 from src.utils.markdown import (
     SLACK_TEXT_LIMIT,
     blockquote,
-    gfm_to_slack,
-    github_mention_logins,
     slack_mention_ids,
     slack_to_gfm,
     split_for_slack,
@@ -60,15 +58,6 @@ logger = logging.getLogger(__name__)
 
 SYNC_TAG = "<!-- pulley-sync -->"
 SLACK_SYNC_PREFIX = "[via Slack]"
-
-
-async def _github_body_to_slack(body: str) -> str:
-    """Render a GitHub comment body as Slack mrkdwn, turning @mentions of linked
-    users into Slack pings. Unlinked logins stay literal.
-    """
-    logins = github_mention_logins(body)
-    mentions = await get_slack_id_map_for_github_usernames(logins) if logins else {}
-    return gfm_to_slack(body, mentions)
 
 
 _REVIEW_STATE_DISPLAY = {
@@ -156,7 +145,7 @@ async def handle_pr_review(payload: dict) -> None:
 
     review_url = review["html_url"]
 
-    body_slack = await _github_body_to_slack(body) if body else ""
+    body_slack = await github_body_to_slack(body) if body else ""
     message = _render_review_message(state, review_url, repo, pr_number, body_slack)
 
     ts_list = await _post_attributed_to_github_user(
@@ -253,7 +242,7 @@ async def handle_review_comment(payload: dict) -> None:
     ts_list: list[str] = []
 
     if mapping:
-        reply_msg = await _github_body_to_slack(body) if body else "replied"
+        reply_msg = await github_body_to_slack(body) if body else "replied"
         try:
             ts_list = await _post_attributed_to_github_user(
                 db_pr.slack_channel_id,
@@ -274,7 +263,7 @@ async def handle_review_comment(payload: dict) -> None:
                 raise
 
     if not ts_list:
-        body_slack = await _github_body_to_slack(body) if body else ""
+        body_slack = await github_body_to_slack(body) if body else ""
         message = _render_review_comment_message(comment, body_slack)
 
         ts_list = await _post_attributed_to_github_user(
@@ -367,7 +356,7 @@ async def handle_issue_comment(payload: dict) -> None:
     org = await get_org(db_pr.organization_id)
     token = org.slack_bot_token if org else None
 
-    body_slack = await _github_body_to_slack(body)
+    body_slack = await github_body_to_slack(body)
     message = _render_issue_comment_message(comment_url, repo, issue_number, body_slack)
     ts_list = await _post_attributed_to_github_user(db_pr.slack_channel_id, message, author, token)
     if ts_list:
@@ -418,7 +407,7 @@ async def handle_review_edited(payload: dict) -> None:
         return
     mapping, _db_pr, token = resolved
 
-    body_slack = await _github_body_to_slack(body) if body else ""
+    body_slack = await github_body_to_slack(body) if body else ""
     message = _render_review_message(
         review["state"], review["html_url"], repo, pr["number"], body_slack
     )
@@ -448,7 +437,7 @@ async def handle_review_comment_edited(payload: dict) -> None:
         return
     mapping, _db_pr, token = resolved
 
-    body_slack = await _github_body_to_slack(body) if body else ""
+    body_slack = await github_body_to_slack(body) if body else ""
     # A reply renders as the body alone; a thread root keeps its rich location header.
     if comment.get("in_reply_to_id"):
         message = body_slack or "replied"
@@ -503,7 +492,7 @@ async def handle_issue_comment_edited(payload: dict) -> None:
     mapping, _db_pr, token = resolved
 
     repo = payload["repository"]["full_name"]
-    body_slack = await _github_body_to_slack(body)
+    body_slack = await github_body_to_slack(body)
     message = _render_issue_comment_message(comment["html_url"], repo, issue["number"], body_slack)
     new_extra = await _resync_attributed_to_github_user(
         mapping.slack_channel_id,

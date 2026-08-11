@@ -1,3 +1,5 @@
+from src.models.issue import Issue
+from src.models.issue_digest_message import IssueDigestMessage
 from src.models.message_mapping import MessageMapping
 from src.models.organization import Organization
 from src.models.pr_digest_message import PRDigestMessage
@@ -14,6 +16,8 @@ __all__ = [
     "User",
     "PullRequest",
     "PRDigestMessage",
+    "Issue",
+    "IssueDigestMessage",
     "SlackChannel",
     "ReviewTimeSlot",
     "ThreadMapping",

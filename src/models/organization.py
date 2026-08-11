@@ -22,6 +22,7 @@ class Organization(Base):
     # Settings
     ci_channel_id: Mapped[str | None] = mapped_column(String(64))
     pr_channel_id: Mapped[str | None] = mapped_column(String(64))
+    issue_channel_id: Mapped[str | None] = mapped_column(String(64))
     recap_channel_id: Mapped[str | None] = mapped_column(String(64))
     recap_cron: Mapped[str | None] = mapped_column(String(64), default="0 9 * * 1-5")
 
