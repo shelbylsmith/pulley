@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from src.db.database import async_session
 from src.models.message_mapping import MessageMapping
 from src.models.organization import Organization
+from src.models.pr_digest_message import PRDigestMessage
 from src.models.pull_request import PullRequest
 from src.models.scheduler_run import SchedulerRun
 from src.models.slack_channel import SlackChannel
@@ -472,12 +473,34 @@ async def create_pr_and_channel(
         return pr
 
 
-async def set_pr_digest_ts(pr_id: int, ts: str) -> None:
+async def get_pr_digest_ts(pr_id: int, channel_id: str) -> str | None:
+    """Return the ts of this PR's digest message in `channel_id`, if we posted one."""
     async with _session() as s:
-        pr = await s.get(PullRequest, pr_id)
-        if pr:
-            pr.pr_digest_ts = ts
-            await s.commit()
+        result = await s.execute(
+            select(PRDigestMessage.slack_ts)
+            .where(PRDigestMessage.pull_request_id == pr_id)
+            .where(PRDigestMessage.slack_channel_id == channel_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def set_pr_digest_ts(pr_id: int, channel_id: str, ts: str) -> None:
+    """Record the ts of this PR's digest message in `channel_id`.
+
+    Upsert rather than insert: a digest message can be replaced (the channel was
+    repointed away and back while the original message was deleted by hand), and
+    concurrent webhook deliveries for the same PR can both reach the post path.
+    """
+    async with _session() as s:
+        await s.execute(
+            pg_insert(PRDigestMessage)
+            .values(pull_request_id=pr_id, slack_channel_id=channel_id, slack_ts=ts)
+            .on_conflict_do_update(
+                constraint="uq_pr_digest_pr_channel",
+                set_={"slack_ts": ts},
+            )
+        )
+        await s.commit()
 
 
 async def set_pr_ci_bookmark_id(pr_id: int, bookmark_id: str) -> None:
