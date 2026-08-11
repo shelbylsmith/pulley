@@ -106,7 +106,7 @@ parallel columns:
 | `SlackChannel` model | `ChatChannel` | `channel_key` string: Slack `C…` id; Teams `{team_id}:{channel_id}` |
 | `MessageMapping.slack_ts` / `slack_ts_extra` | `message_key` / `message_key_extra` | Opaque per-platform serialized `MessageRef` |
 | `ThreadMapping.slack_thread_ts` | `thread_key` | Teams thread anchor = root message id |
-| `PullRequest.pr_digest_ts` | `pr_digest_key` | For Teams also needs the activity id for `UpdateActivity` |
+| `PRDigestMessage.slack_channel_id` / `slack_ts` | `channel_key` / `pr_digest_key` | For Teams also needs the activity id for `UpdateActivity` |
 | `PullRequest.ci_bookmark_id` / `title_bookmark_id` | `status_card_key` | Bookmarks → status-card message |
 
 Queries in `src/db/queries.py` rename accordingly (`get_org_by_slack_team` →

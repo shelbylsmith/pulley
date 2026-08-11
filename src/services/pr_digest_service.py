@@ -2,13 +2,19 @@
 
 Posted once when the PR opens, updated in place on state changes. Uses a
 Slack attachment for the colored left-sidebar; blocks for the body layout.
+
+The org's PR channel is a setting that can be repointed. A message ts is only
+addressable in the channel it was posted to, so every digest is tracked per
+(PR, channel) — see `PRDigestMessage`. After a repoint, each PR moves to the new
+channel on its next state change, and messages left in the old channel are
+picked up again if the org ever points back at it.
 """
 
 import logging
 
 import slack_sdk.errors
 
-from src.db.queries import get_pr_by_github_id, set_pr_digest_ts
+from src.db.queries import get_pr_by_github_id, get_pr_digest_ts, set_pr_digest_ts
 from src.models.organization import Organization
 from src.models.pull_request import PullRequest
 from src.services import slack_service
@@ -114,17 +120,24 @@ async def post_initial(pr: PullRequest, org: Organization) -> None:
         return
     ts = resp.get("ts")
     if ts:
-        await set_pr_digest_ts(pr.id, ts)
-        logger.info("Posted PR digest for %s#%d ts=%s", pr.repo_full_name, pr.github_pr_number, ts)
+        await set_pr_digest_ts(pr.id, org.pr_channel_id, ts)
+        logger.info(
+            "Posted PR digest for %s#%d in %s ts=%s",
+            pr.repo_full_name,
+            pr.github_pr_number,
+            org.pr_channel_id,
+            ts,
+        )
 
 
 async def update(github_pr_id: int, org: Organization) -> None:
     """Re-render the digest for a PR after a state change.
 
     Reloads the PR from DB so the caller doesn't need to pass a fresh row.
-    If the digest wasn't posted yet (PR opened as draft, or pr_channel was
-    configured after the PR opened), post it now — unless the PR is still
-    in draft, in which case we keep holding off.
+    If this PR has no digest in the org's *current* PR channel — it opened as a
+    draft, the channel was configured after it opened, or the channel has since
+    been repointed — post one now, unless the PR is still in draft, in which
+    case we keep holding off.
     """
     if not org.pr_channel_id or not org.slack_bot_token:
         return
@@ -132,8 +145,8 @@ async def update(github_pr_id: int, org: Organization) -> None:
     if not pr:
         return
 
-    if not pr.pr_digest_ts:
-        # First time we're rendering this PR's digest — post rather than update
+    ts = await get_pr_digest_ts(pr.id, org.pr_channel_id)
+    if not ts:
         await post_initial(pr, org)
         return
 
@@ -141,7 +154,7 @@ async def update(github_pr_id: int, org: Organization) -> None:
     try:
         await slack_service.update_message(
             org.pr_channel_id,
-            pr.pr_digest_ts,
+            ts,
             attachments=attachments,
             token=org.slack_bot_token,
         )
@@ -154,8 +167,9 @@ async def update(github_pr_id: int, org: Organization) -> None:
         )
         return
     logger.info(
-        "Updated PR digest for %s#%d ts=%s",
+        "Updated PR digest for %s#%d in %s ts=%s",
         pr.repo_full_name,
         pr.github_pr_number,
-        pr.pr_digest_ts,
+        org.pr_channel_id,
+        ts,
     )

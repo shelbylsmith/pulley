@@ -1,5 +1,6 @@
 from src.models.message_mapping import MessageMapping
 from src.models.organization import Organization
+from src.models.pr_digest_message import PRDigestMessage
 from src.models.pull_request import PullRequest
 from src.models.review_time_slot import ReviewTimeSlot
 from src.models.scheduler_run import SchedulerRun
@@ -12,6 +13,7 @@ __all__ = [
     "Organization",
     "User",
     "PullRequest",
+    "PRDigestMessage",
     "SlackChannel",
     "ReviewTimeSlot",
     "ThreadMapping",

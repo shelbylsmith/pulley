@@ -33,8 +33,6 @@ class PullRequest(Base):
     slack_channel_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     no_slack_channel: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Digest message in the org-level PR channel (one-message-per-PR view)
-    pr_digest_ts: Mapped[str | None] = mapped_column(String(64))
     # Bookmark in the PR's Slack channel showing rolled-up CI state
     ci_bookmark_id: Mapped[str | None] = mapped_column(String(64))
     # Bookmark in the PR's Slack channel linking to the PR; its title is kept in
