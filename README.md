@@ -15,7 +15,8 @@ in place as the PR moves through its lifecycle.
 - **Bidirectional sync** — GitHub review comments, review threads, and issue comments land in Slack (threaded); Slack channel messages and thread replies post back to GitHub. Thread replies on one side replay as thread replies on the other. Edits and deletions propagate too: editing or deleting a synced comment/message on either side updates or removes its mirror on the other.
 - **Attributed posts** — Slack → GitHub posts use the user's OAuth token (appears as them on GitHub). GitHub → Slack posts use `chat:write.customize` to render with the user's Slack display name and avatar. Users who haven't linked fall back to bot-attributed posts.
 - **Org-wide PR digest** — one Slack message per PR in a configurable channel, with a colored sidebar + status emoji. Updated in place on draft ↔ ready, approved, changes requested, merged, closed. Drafts are suppressed until marked ready.
-- **Slash commands** — `/pulley open`, `/pulley me`, `/pulley team <name>`, `/pulley merge [squash|rebase|merge]`, `/pulley settings [pr|ci|recap #channel]` (see [Configure channels](#5-configure-channels)); `/lgtm [comment]` to approve from Slack.
+- **Issue cards** — one Slack message per GitHub issue in a configurable channel, with a colored sidebar + status emoji. Updated in place as the issue is edited, labelled, assigned, closed and reopened; removed if the issue is deleted.
+- **Slash commands** — `/pulley open`, `/pulley me`, `/pulley team <name>`, `/pulley merge [squash|rebase|merge]`, `/pulley settings [pr|ci|issues|recap #channel]` (see [Configure channels](#5-configure-channels)); `/lgtm [comment]` to approve from Slack.
 - **CI / deployment notifications** — workflow run failures and deployment statuses post to the configured CI channel.
 - **Daily recap + stale reminders** — weekday PR summaries and stale-PR nudges, driven by the built-in scheduler or by an external cron hitting the internal endpoints (see [Configuration](#configuration)).
 - **Repo allowlist / excludes** — `GITHUB_ALLOWED_REPOS` env var (comma-separated `owner/repo`) scopes the bot to a subset of installed repos for soft-launches; empty = all. `GITHUB_EXCLUDED_REPOS` (same format) drops events from specific repos even if they'd otherwise be allowed — exclusion wins over the allowlist.
@@ -100,7 +101,7 @@ Required permissions (Repository):
 - Members: read
 - Emails: read
 
-Subscribe to events: pull_request, pull_request_review, pull_request_review_comment, pull_request_review_thread, issue_comment, check_suite, deployment_status, workflow_run.
+Subscribe to events: pull_request, pull_request_review, pull_request_review_comment, pull_request_review_thread, issues, issue_comment, check_suite, deployment_status, workflow_run.
 
 Webhook URL: `https://<your-domain>/webhooks/github`. Set a webhook secret; save it as `GITHUB_WEBHOOK_SECRET`.
 
@@ -146,7 +147,7 @@ If the events landed out of order and you end up with two `organizations` rows (
 
 ### 5. Configure channels
 
-Pulley posts three kinds of org-wide message, each to its own channel. All three
+Pulley posts four kinds of org-wide message, each to its own channel. All four
 are **off until you set a channel** — an unset setting means Pulley posts nothing
 for it, so you can adopt them one at a time. They're independent; pointing two of
 them at the same channel is fine.
@@ -155,6 +156,7 @@ them at the same channel is fine.
 | --- | --- | --- |
 | `pr` | One message per open PR, updated in place as reviews land. Draft PRs are held back until marked ready for review. | GitHub PR webhooks |
 | `ci` | Failed checks and deployment statuses — default branch only, and only for branch-scoped events. | `check_suite` / `deployment_status` webhooks |
+| `issues` | One message per issue, updated in place as it's edited, labelled, assigned, closed and reopened. | `issues` webhooks |
 | `recap` | A daily summary of the org's open PRs. | Schedule (`0 9 * * 1-5` UTC by default) |
 
 Set them from any Slack channel:
@@ -162,13 +164,14 @@ Set them from any Slack channel:
 ```
 /pulley settings pr #eng-prs
 /pulley settings ci #eng-alerts
+/pulley settings issues #eng-issues
 /pulley settings recap #eng-standup
 ```
 
 Reading them back:
 
 ```
-/pulley settings          # all three + GitHub link status, with what each one posts
+/pulley settings          # all four + GitHub link status, with what each one posts
 /pulley settings ci       # just that one
 ```
 
@@ -180,6 +183,12 @@ Notes:
   configured while every post to it silently failed.
 - **Private channels** need Pulley invited to them first. Public channels work
   without an invite (the bot holds `chat:write.public`).
+- **`pr` and `issues` can be repointed** at a new channel whenever you like. Each
+  PR/issue moves across on its next event, so the new channel fills up as work
+  happens rather than all at once; messages already posted to the old channel are
+  left where they are, and are picked up again if you point back at it. A PR or
+  issue that was already open when you first set the channel appears the same
+  way — on its next event.
 - **The recap schedule** is per-org in the `organizations.recap_cron` column, and
   falls back to the `RECAP_CRON` env var when that's `NULL`. It isn't settable
   from Slack — `/pulley settings` displays the effective value.
@@ -249,7 +258,7 @@ Common tasks (`just test`, `just lint`, `just fmt`, `just migrate-gen`,
 ```
 src/
   routers/         FastAPI endpoints (webhooks, commands, events, auth, internal)
-  services/        Business logic (channel_manager, sync_service, pr_digest_service, notification_service, …)
+  services/        Business logic (channel_manager, sync_service, pr_digest_service, notification_service, issue_service, …)
   models/          SQLAlchemy ORM models
   db/              Database session + Alembic migrations
   utils/           Signature verification, misc helpers

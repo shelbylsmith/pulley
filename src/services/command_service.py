@@ -210,6 +210,7 @@ async def _cmd_merge(channel_id: str, slack_user_id: str, method: str) -> dict:
 _SETTINGS: dict[str, tuple[str, str]] = {
     "pr": ("pr_channel_id", "PR digest"),
     "ci": ("ci_channel_id", "CI alerts"),
+    "issues": ("issue_channel_id", "Issue cards"),
     "recap": ("recap_channel_id", "Daily recap"),
 }
 
@@ -237,6 +238,10 @@ def _blurb(name: str, org) -> str:
         return "one message per open PR, updated in place as reviews land"
     if name == "ci":
         return "failed checks and deployment statuses on the default branch"
+    if name == "issues":
+        return (
+            "one message per GitHub issue, updated in place as it's labelled, assigned and closed"
+        )
 
     from src.config import settings as app_settings
 
@@ -341,7 +346,7 @@ def _cmd_help() -> dict:
             "• `/pulley team <name>` — list PRs for a team\n"
             "• `/pulley merge [method]` — merge this PR (merge/squash/rebase)\n"
             "• `/pulley settings` — show which channels Pulley posts to\n"
-            "• `/pulley settings pr|ci|recap #channel` — change one of them\n"
+            "• `/pulley settings pr|ci|issues|recap #channel` — change one of them\n"
             "• `/lgtm [comment]` — approve this PR"
         ),
     }

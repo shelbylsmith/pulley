@@ -14,6 +14,7 @@ def make_org(**overrides):
         "github_org_login": None,
         "pr_channel_id": None,
         "ci_channel_id": None,
+        "issue_channel_id": None,
         "recap_channel_id": None,
         "recap_cron": None,
     }
@@ -75,10 +76,11 @@ async def test_overview_names_every_setting_and_what_it_posts(org_and_writes):
 
     text = result["text"]
     assert result["response_type"] == "ephemeral"
-    for name in ("pr", "ci", "recap"):
+    for name in ("pr", "ci", "issues", "recap"):
         assert f"`{name}`" in text
     assert "PR digest" in text
     assert "CI alerts" in text
+    assert "Issue cards" in text
     assert "Daily recap" in text
     assert "_not set_" in text
 
@@ -136,10 +138,12 @@ async def test_setting_a_channel_writes_the_matching_column(org_and_writes):
 async def test_each_setting_maps_to_its_own_column(org_and_writes):
     await command_service._cmd_settings("ci <#C1>", "T1", "C0")
     await command_service._cmd_settings("recap <#C2>", "T1", "C0")
+    await command_service._cmd_settings("issues <#C3>", "T1", "C0")
 
     assert org_and_writes.writes == [
         (1, {"ci_channel_id": "C1"}),
         (1, {"recap_channel_id": "C2"}),
+        (1, {"issue_channel_id": "C3"}),
     ]
 
 
