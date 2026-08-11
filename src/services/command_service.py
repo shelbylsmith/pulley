@@ -206,6 +206,71 @@ async def _cmd_merge(channel_id: str, slack_user_id: str, method: str) -> dict:
     }
 
 
+# `/pulley settings <name>` → the organizations column it writes, and its label.
+_SETTINGS: dict[str, tuple[str, str]] = {
+    "pr": ("pr_channel_id", "PR digest"),
+    "ci": ("ci_channel_id", "CI alerts"),
+    "recap": ("recap_channel_id", "Daily recap"),
+}
+
+
+def _parse_channel_id(raw: str) -> str | None:
+    """Extract the channel ID from Slack's escaped channel mention.
+
+    `should_escape` is on for /pulley, so a channel the user picked from Slack's
+    autocomplete arrives as a mention rather than plain text: `<#C123|name>` for
+    a public channel, and the ID alone for a private one.
+
+    Returns None for anything else. Text Slack declined to linkify isn't a
+    channel we can post to, and storing it would leave the setting looking
+    configured while every later post failed.
+    """
+    if not (raw.startswith("<") and raw.endswith(">")):
+        return None
+    cid = raw[1:-1].lstrip("#").split("|", 1)[0]
+    return cid or None
+
+
+def _blurb(name: str, org) -> str:
+    """What Pulley posts to the channel behind `name`, phrased to follow "Pulley posts"."""
+    if name == "pr":
+        return "one message per open PR, updated in place as reviews land"
+    if name == "ci":
+        return "failed checks and deployment statuses on the default branch"
+
+    from src.config import settings as app_settings
+
+    cron = org.recap_cron or app_settings.recap_cron
+    return f"a summary of open PRs, on the `{cron}` schedule (UTC)"
+
+
+def _settings_overview(org) -> str:
+    if org.github_installation_id and org.github_org_login:
+        gh_status = f"✅ Linked to *{org.github_org_login}*"
+    else:
+        gh_status = (
+            "⚠️ Not linked — open the Pulley App Home and click "
+            "*Link organization* to connect a GitHub org"
+        )
+
+    lines = ["*Pulley settings*", f"GitHub: {gh_status}", "", "*Channels*"]
+    for name, (column, label) in _SETTINGS.items():
+        target = f"<#{getattr(org, column)}>" if getattr(org, column) else "_not set_"
+        lines.append(f"• *{label}* — `{name}` → {target}")
+        lines.append(f"     Pulley posts {_blurb(name, org)}.")
+
+    lines += [
+        "",
+        "*Usage*",
+        "• `/pulley settings <name> #channel` — send that kind of message to #channel",
+        "• `/pulley settings <name>` — show just that one",
+        "",
+        "A setting with no channel is off — Pulley posts nothing for it. "
+        "For a private channel, invite Pulley to it first.",
+    ]
+    return "\n".join(lines)
+
+
 async def _cmd_settings(arg: str, team_id: str, channel_id: str) -> dict:
     from src.db.queries import get_org_by_slack_team, update_org_settings
 
@@ -214,99 +279,56 @@ async def _cmd_settings(arg: str, team_id: str, channel_id: str) -> dict:
         return {"response_type": "ephemeral", "text": "Organization not connected."}
 
     parts = arg.split(maxsplit=1)
-    setting = parts[0].lower() if parts else ""
+    name = parts[0].lower() if parts else ""
     value = parts[1].strip() if len(parts) > 1 else ""
 
-    # Strip Slack's channel formatting: <#C12345|channel-name> → C12345.
-    # If the user just typed `#foo` (no channel link), strip the leading `#`
-    # so we don't end up rendering `<##foo>` in the settings display.
-    def _parse_channel_id(raw: str) -> str:
-        if raw.startswith("<#") and "|" in raw:
-            return raw[2 : raw.index("|")]
-        if raw.startswith("<#") and raw.endswith(">"):
-            return raw[2:-1]
-        return raw.lstrip("#")
+    if not name:
+        return {"response_type": "ephemeral", "text": _settings_overview(org)}
 
-    if setting == "recap":
-        if not value:
-            if org.recap_channel_id:
-                return {
-                    "response_type": "ephemeral",
-                    "text": f"Recap channel: <#{org.recap_channel_id}>",
-                }
-            return {"response_type": "ephemeral", "text": "No recap channel configured."}
-
-        cid = _parse_channel_id(value)
-        await update_org_settings(org.id, recap_channel_id=cid)
+    if name not in _SETTINGS:
+        valid = ", ".join(f"`{k}`" for k in _SETTINGS)
         return {
             "response_type": "ephemeral",
-            "text": f"Recap channel set to <#{cid}>",
+            "text": (
+                f"Unknown setting `{name}`. Valid settings: {valid}.\n"
+                "Run `/pulley settings` to see what each one does."
+            ),
         }
 
-    elif setting == "ci":
-        if not value:
-            if org.ci_channel_id:
-                return {
-                    "response_type": "ephemeral",
-                    "text": f"CI channel: <#{org.ci_channel_id}>",
-                }
+    column, label = _SETTINGS[name]
+
+    if not value:
+        current = getattr(org, column)
+        if not current:
             return {
                 "response_type": "ephemeral",
-                "text": "No CI channel configured.",
+                "text": (
+                    f"*{label}* — `{name}` → _not set_, so Pulley posts nothing for it.\n"
+                    f"Run `/pulley settings {name} #channel` and that channel will get: "
+                    f"{_blurb(name, org)}."
+                ),
             }
-
-        cid = _parse_channel_id(value)
-        await update_org_settings(org.id, ci_channel_id=cid)
         return {
             "response_type": "ephemeral",
-            "text": f"CI channel set to <#{cid}>",
+            "text": f"*{label}* — `{name}` → <#{current}>\nPulley posts {_blurb(name, org)}.",
         }
 
-    elif setting == "pr":
-        if not value:
-            if org.pr_channel_id:
-                return {
-                    "response_type": "ephemeral",
-                    "text": f"PR digest channel: <#{org.pr_channel_id}>",
-                }
-            return {
-                "response_type": "ephemeral",
-                "text": "No PR digest channel configured.",
-            }
-
-        cid = _parse_channel_id(value)
-        await update_org_settings(org.id, pr_channel_id=cid)
+    cid = _parse_channel_id(value)
+    if not cid:
         return {
             "response_type": "ephemeral",
-            "text": f"PR digest channel set to <#{cid}>",
+            "text": (
+                f"Couldn't read a channel from `{value}`. Pick the channel from Slack's "
+                f"autocomplete as you type, so it arrives as a link — "
+                f"`/pulley settings {name} #channel`."
+            ),
         }
 
-    else:
-        recap = f"<#{org.recap_channel_id}>" if org.recap_channel_id else "_not set_"
-        ci = f"<#{org.ci_channel_id}>" if org.ci_channel_id else "_not set_"
-        pr_ch = f"<#{org.pr_channel_id}>" if org.pr_channel_id else "_not set_"
-
-        if org.github_installation_id and org.github_org_login:
-            gh_status = f"✅ Linked to *{org.github_org_login}*"
-        else:
-            gh_status = (
-                "⚠️ Not linked — open the Pulley App Home and click "
-                "*Link organization* to connect a GitHub org"
-            )
-
-        lines = [
-            "*Pulley settings:*",
-            f"  GitHub: {gh_status}",
-            f"  Recap channel: {recap}",
-            f"  CI channel: {ci}",
-            f"  PR digest channel: {pr_ch}",
-            "",
-            "*Usage:*",
-            "  `/pulley settings recap #channel`",
-            "  `/pulley settings ci #channel`",
-            "  `/pulley settings pr #channel`",
-        ]
-        return {"response_type": "ephemeral", "text": "\n".join(lines)}
+    await update_org_settings(org.id, **{column: cid})
+    return {
+        "response_type": "ephemeral",
+        "text": f"*{label}* → <#{cid}>\nThat channel now gets: {_blurb(name, org)}.",
+    }
 
 
 def _cmd_help() -> dict:
@@ -318,7 +340,8 @@ def _cmd_help() -> dict:
             "• `/pulley me` — list your open PRs\n"
             "• `/pulley team <name>` — list PRs for a team\n"
             "• `/pulley merge [method]` — merge this PR (merge/squash/rebase)\n"
-            "• `/pulley settings` — configure channels\n"
+            "• `/pulley settings` — show which channels Pulley posts to\n"
+            "• `/pulley settings pr|ci|recap #channel` — change one of them\n"
             "• `/lgtm [comment]` — approve this PR"
         ),
     }

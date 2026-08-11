@@ -15,7 +15,7 @@ in place as the PR moves through its lifecycle.
 - **Bidirectional sync** — GitHub review comments, review threads, and issue comments land in Slack (threaded); Slack channel messages and thread replies post back to GitHub. Thread replies on one side replay as thread replies on the other. Edits and deletions propagate too: editing or deleting a synced comment/message on either side updates or removes its mirror on the other.
 - **Attributed posts** — Slack → GitHub posts use the user's OAuth token (appears as them on GitHub). GitHub → Slack posts use `chat:write.customize` to render with the user's Slack display name and avatar. Users who haven't linked fall back to bot-attributed posts.
 - **Org-wide PR digest** — one Slack message per PR in a configurable channel, with a colored sidebar + status emoji. Updated in place on draft ↔ ready, approved, changes requested, merged, closed. Drafts are suppressed until marked ready.
-- **Slash commands** — `/pulley open`, `/pulley me`, `/pulley team <name>`, `/pulley merge [squash|rebase|merge]`, `/pulley settings`; `/lgtm [comment]` to approve from Slack.
+- **Slash commands** — `/pulley open`, `/pulley me`, `/pulley team <name>`, `/pulley merge [squash|rebase|merge]`, `/pulley settings [pr|ci|recap #channel]` (see [Configure channels](#5-configure-channels)); `/lgtm [comment]` to approve from Slack.
 - **CI / deployment notifications** — workflow run failures and deployment statuses post to the configured CI channel.
 - **Daily recap + stale reminders** — weekday PR summaries and stale-PR nudges, driven by the built-in scheduler or by an external cron hitting the internal endpoints (see [Configuration](#configuration)).
 - **Repo allowlist / excludes** — `GITHUB_ALLOWED_REPOS` env var (comma-separated `owner/repo`) scopes the bot to a subset of installed repos for soft-launches; empty = all. `GITHUB_EXCLUDED_REPOS` (same format) drops events from specific repos even if they'd otherwise be allowed — exclusion wins over the allowlist.
@@ -146,15 +146,48 @@ If the events landed out of order and you end up with two `organizations` rows (
 
 ### 5. Configure channels
 
-In any Slack channel where the bot is a member:
+Pulley posts three kinds of org-wide message, each to its own channel. All three
+are **off until you set a channel** — an unset setting means Pulley posts nothing
+for it, so you can adopt them one at a time. They're independent; pointing two of
+them at the same channel is fine.
+
+| Setting | Channel gets | Triggered by |
+| --- | --- | --- |
+| `pr` | One message per open PR, updated in place as reviews land. Draft PRs are held back until marked ready for review. | GitHub PR webhooks |
+| `ci` | Failed checks and deployment statuses — default branch only, and only for branch-scoped events. | `check_suite` / `deployment_status` webhooks |
+| `recap` | A daily summary of the org's open PRs. | Schedule (`0 9 * * 1-5` UTC by default) |
+
+Set them from any Slack channel:
 
 ```
-/pulley settings pr #channel      # org-wide PR digest
-/pulley settings ci #channel      # CI / workflow failures, deployment statuses
-/pulley settings recap #channel   # Daily PR recap at 9am UTC (weekdays)
+/pulley settings pr #eng-prs
+/pulley settings ci #eng-alerts
+/pulley settings recap #eng-standup
 ```
 
-`/pulley settings` (no args) shows current values + GitHub link status.
+Reading them back:
+
+```
+/pulley settings          # all three + GitHub link status, with what each one posts
+/pulley settings ci       # just that one
+```
+
+Notes:
+
+- **Pick the channel from Slack's autocomplete** as you type, so it reaches Pulley
+  as a channel link rather than plain text. A value Slack didn't linkify is
+  rejected with a hint instead of being stored — otherwise the setting would look
+  configured while every post to it silently failed.
+- **Private channels** need Pulley invited to them first. Public channels work
+  without an invite (the bot holds `chat:write.public`).
+- **The recap schedule** is per-org in the `organizations.recap_cron` column, and
+  falls back to the `RECAP_CRON` env var when that's `NULL`. It isn't settable
+  from Slack — `/pulley settings` displays the effective value.
+- **Stale-PR reminders** are separate: they go to each PR's own channel on the
+  `STALE_REMINDER_CRON` schedule, with no per-org setting to configure.
+- Recap and stale reminders only fire if `SCHEDULER_ENABLED=true` or an external
+  cron is hitting the `/internal/*` endpoints. See
+  [docs/self-hosting.md](docs/self-hosting.md).
 
 ## Deployment
 

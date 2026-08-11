@@ -152,7 +152,8 @@ def _build_home(user, slack_user_id: str, team_id: str, org) -> list[dict]:
                     "• `/pulley me` — list your open PRs\n"
                     "• `/pulley team <name>` — list PRs for a team\n"
                     "• `/pulley merge [method]` — merge this PR\n"
-                    "• `/pulley settings` — configure channels\n"
+                    "• `/pulley settings` — show which channels Pulley posts to\n"
+                    "• `/pulley settings pr|ci|recap #channel` — change one of them\n"
                     "• `/lgtm [comment]` — approve this PR"
                 ),
             },
