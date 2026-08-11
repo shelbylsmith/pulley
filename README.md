@@ -183,6 +183,10 @@ Notes:
   configured while every post to it silently failed.
 - **Private channels** need Pulley invited to them first. Public channels work
   without an invite (the bot holds `chat:write.public`).
+- **`issues` needs the `Issues` permission and the `issues` event** on your
+  GitHub App — both are in [Create the GitHub App](#1-create-the-github-app). If
+  the event isn't subscribed the setting looks configured but nothing ever posts,
+  because GitHub never sends the webhook.
 - **`pr` and `issues` can be repointed** at a new channel whenever you like. Each
   PR/issue moves across on its next event, so the new channel fills up as work
   happens rather than all at once; messages already posted to the old channel are
