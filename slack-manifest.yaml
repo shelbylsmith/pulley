@@ -21,8 +21,8 @@ features:
       should_escape: false
     - command: /pulley
       url: https://YOUR-PULLEY-DOMAIN/slack/commands/pulley
-      description: Pulley PR commands
-      usage_hint: "open | me | team <name> | merge [method]"
+      description: List PRs, merge this PR, or configure Pulley's channels
+      usage_hint: "open | me | team <name> | merge | settings [pr|ci|recap #channel]"
       should_escape: true
 
 oauth_config:
