@@ -51,9 +51,32 @@ def _short_repo(full_name: str) -> str:
     return full_name.split("/")[-1]
 
 
+def _fallback_text(pr: PullRequest) -> str:
+    """Plain-text summary of the digest, for notifications and message previews.
+
+    Slack has nothing to put in a notification for a message whose content lives
+    in an attachment, which is what leaves the preview blank. The attachment's
+    own `fallback` carries it; a top-level `text` would too, but only by
+    rendering as a duplicate line of body copy above the card, since `text` is
+    hidden only when top-level `blocks` are present and these are not.
+
+    Per Slack's attachment reference this is a plain-text field, so it holds no
+    markup — no links, no mrkdwn.
+    """
+    label, emoji, _ = _STATE_STYLE[_state_key(pr)]
+    return (
+        f"{emoji} PR #{pr.github_pr_number} {pr.title} ({_short_repo(pr.repo_full_name)}) — {label}"
+    )
+
+
 def _render(pr: PullRequest) -> list[dict]:
-    """Return the attachments list for a digest message. No top-level text —
-    attachments only, so chat.update doesn't trigger the "(edited)" indicator.
+    """Return the attachments list for a digest message.
+
+    Carries no top-level text: per Slack's chat.update docs it is `text` that
+    flips the "(edited)" indicator, and a card re-rendered on every state change
+    would wear it permanently. The preview rides in the attachment instead, so
+    it refreshes with the card rather than freezing at whatever the PR was when
+    it opened.
     """
     label, emoji, color = _STATE_STYLE[_state_key(pr)]
     channel_ref = f"<#{pr.slack_channel_id}>" if pr.slack_channel_id else "_no channel_"
@@ -83,7 +106,7 @@ def _render(pr: PullRequest) -> list[dict]:
         },
     ]
 
-    attachment = {"color": color, "blocks": blocks}
+    attachment = {"color": color, "fallback": _fallback_text(pr), "blocks": blocks}
     return [attachment]
 
 
