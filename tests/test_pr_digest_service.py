@@ -123,3 +123,47 @@ async def test_draft_pr_is_not_posted_to_a_repointed_channel():
         await pr_digest_service.update(99, _org(_NEW_CHANNEL))
 
     post.assert_not_awaited()
+
+
+def test_card_carries_a_plain_text_fallback_for_notifications():
+    """Slack has nothing to notify with when a message is all attachment; the
+    fallback is what fills the preview, and it must not render in the body."""
+    fallback = pr_digest_service._render(_pr())[0]["fallback"]
+
+    assert "PR #42" in fallback
+    assert "Add widgets" in fallback
+    assert "reviewable" in fallback
+    # Plain text per Slack's attachment reference — no links or mrkdwn.
+    assert "<" not in fallback and "*" not in fallback
+
+
+def test_fallback_follows_the_state_the_card_shows():
+    fallback = pr_digest_service._render(_pr(state="merged"))[0]["fallback"]
+
+    assert "merged" in fallback
+
+
+@pytest.mark.asyncio
+async def test_posting_and_updating_both_send_no_top_level_text():
+    """Top-level text would show as a duplicate line above the card, and on an
+    update it would also flip Slack's "(edited)" marker."""
+    with (
+        patch.object(
+            pr_digest_service.slack_service,
+            "post_message",
+            AsyncMock(return_value={"ts": "333.3"}),
+        ) as post,
+        patch.object(pr_digest_service, "set_pr_digest_ts", AsyncMock()),
+    ):
+        await pr_digest_service.post_initial(_pr(), _org())
+
+    assert "text" not in post.await_args.kwargs
+
+    with (
+        patch.object(pr_digest_service, "get_pr_by_github_id", AsyncMock(return_value=_pr())),
+        patch.object(pr_digest_service, "get_pr_digest_ts", AsyncMock(return_value="111.1")),
+        patch.object(pr_digest_service.slack_service, "update_message", AsyncMock()) as edit,
+    ):
+        await pr_digest_service.update(99, _org())
+
+    assert "text" not in edit.await_args.kwargs

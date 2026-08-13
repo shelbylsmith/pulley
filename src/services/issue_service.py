@@ -84,9 +84,33 @@ def _body_excerpt(body_slack: str) -> str:
     return split_for_slack(body_slack, _BODY_LIMIT)[0] + _TRUNCATION_MARK
 
 
+def _fallback_text(issue: Issue) -> str:
+    """Plain-text summary of the card, for notifications and message previews.
+
+    Slack has nothing to put in a notification for a message whose content lives
+    in an attachment, which is what leaves the preview blank. The attachment's
+    own `fallback` carries it; a top-level `text` would too, but only by
+    rendering as a duplicate line of body copy above the card, since `text` is
+    hidden only when top-level `blocks` are present and these are not.
+
+    Per Slack's attachment reference this is a plain-text field, so it holds no
+    markup — no links, no mrkdwn.
+    """
+    label, emoji, _ = _STATE_STYLE[_state_key(issue)]
+    return (
+        f"{emoji} Issue #{issue.github_issue_number} {issue.title} "
+        f"({_short_repo(issue.repo_full_name)}) — {label}"
+    )
+
+
 def _render(issue: Issue, body_slack: str) -> list[dict]:
-    """Return the attachments list for a card. No top-level text — attachments
-    only, so chat.update doesn't trigger the "(edited)" indicator.
+    """Return the attachments list for a card.
+
+    Carries no top-level text: per Slack's chat.update docs it is `text` that
+    flips the "(edited)" indicator, and a card re-rendered on every issue event
+    would wear it permanently. The preview rides in the attachment instead, so
+    it refreshes with the card rather than freezing at whatever the issue was
+    when it opened.
     """
     label, emoji, color = _STATE_STYLE[_state_key(issue)]
 
@@ -121,7 +145,7 @@ def _render(issue: Issue, body_slack: str) -> list[dict]:
             }
         )
 
-    return [{"color": color, "blocks": blocks}]
+    return [{"color": color, "fallback": _fallback_text(issue), "blocks": blocks}]
 
 
 def _joined(items: list[dict], key: str) -> str | None:

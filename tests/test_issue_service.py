@@ -157,6 +157,26 @@ def test_card_marks_unlabelled_and_unassigned_issues_as_none():
     assert "*Assignees:*\n_none_" in text
 
 
+def test_card_carries_a_plain_text_fallback_for_notifications():
+    """Slack has nothing to notify with when a message is all attachment; the
+    fallback is what fills the preview, and it must not render in the body."""
+    fallback = issue_service._render(_issue(), "Steps to reproduce")[0]["fallback"]
+
+    assert "Issue #42" in fallback
+    assert "Parser drops trailing newlines" in fallback
+    assert "open" in fallback
+    # Plain text per Slack's attachment reference — no links or mrkdwn.
+    assert "<" not in fallback and "*" not in fallback
+
+
+def test_fallback_follows_the_state_the_card_shows():
+    fallback = issue_service._render(_issue(state="closed", state_reason="not_planned"), "")[0][
+        "fallback"
+    ]
+
+    assert "closed as not planned" in fallback
+
+
 @pytest.mark.parametrize(
     ("state", "reason", "expected"),
     [
