@@ -308,6 +308,13 @@ async def get_workflow_run(installation_id: int, repo: str, run_id: int) -> dict
     return resp.json()
 
 
+async def get_workflow_job(installation_id: int, repo: str, job_id: int) -> dict:
+    """Fetch a GitHub Actions job by id (for its conclusion, etc.)."""
+    resp = await github_request("GET", f"/repos/{repo}/actions/jobs/{job_id}", installation_id)
+    resp.raise_for_status()
+    return resp.json()
+
+
 async def get_open_pulls(installation_id: int, repo: str) -> list[dict]:
     path = f"/repos/{repo}/pulls?state=open&per_page=100"
     resp = await github_request("GET", path, installation_id)

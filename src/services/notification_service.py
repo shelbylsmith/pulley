@@ -22,9 +22,13 @@ logger = logging.getLogger(__name__)
 
 
 # Failure-ish conclusions that should mark the rollup red.
-_CI_FAILED = {"failure", "timed_out", "cancelled", "action_required", "stale"}
+_CI_FAILED = {"failure", "timed_out", "action_required"}
 # Conclusions that count as a clean pass.
 _CI_PASSED = {"success", "neutral", "skipped"}
+# Runs that never reached a verdict: cancelled by hand or by concurrency
+# rules, or superseded by a newer push (GitHub marks those "stale"). Neither a
+# pass nor a failure, so they never trigger an alert or a recap.
+_CI_INCONCLUSIVE = {"cancelled", "stale"}
 
 # Workflow-trigger events whose head_sha is a commit on the branch itself —
 # a push/merge, a manual dispatch, or a scheduled run. PR- and comment-scoped
@@ -79,7 +83,8 @@ def _completion_state(check_runs: list[dict]) -> str | None:
     """Return 'passed'/'failed' once all check-runs are complete, else None.
 
     Used to gate recap messages: we only post when CI is fully done, and only
-    on transitions (passed↔failed) — not every completion event.
+    on transitions (passed↔failed) — not every completion event. A cancelled
+    or stale run leaves the suite without a verdict, so it yields None too.
     """
     if not check_runs:
         return None
@@ -87,13 +92,16 @@ def _completion_state(check_runs: list[dict]) -> str | None:
         return None
     if any(c.get("conclusion") in _CI_FAILED for c in check_runs):
         return "failed"
+    if any(c.get("conclusion") in _CI_INCONCLUSIVE for c in check_runs):
+        return None
     return "passed"
 
 
 def _aggregate_check_state(check_runs: list[dict]) -> tuple[str, str, str]:
     """Roll a list of check-runs into (emoji, short_title, long_text).
 
-    Rules: any failure → ❌; otherwise any in-progress/queued → ⏳; otherwise ✅.
+    Rules: any failure → ❌; otherwise any in-progress/queued → ⏳; otherwise
+    any cancelled/stale → 🚫; otherwise ✅.
     Empty list → ⏳ (waiting for first check to register).
     """
     if not check_runs:
@@ -101,6 +109,7 @@ def _aggregate_check_state(check_runs: list[dict]) -> tuple[str, str, str]:
 
     failed = sum(1 for c in check_runs if c.get("conclusion") in _CI_FAILED)
     passed = sum(1 for c in check_runs if c.get("conclusion") in _CI_PASSED)
+    cancelled = sum(1 for c in check_runs if c.get("conclusion") in _CI_INCONCLUSIVE)
     in_progress = sum(1 for c in check_runs if c.get("status") != "completed")
     total = len(check_runs)
 
@@ -109,6 +118,9 @@ def _aggregate_check_state(check_runs: list[dict]) -> tuple[str, str, str]:
     if in_progress:
         long = f"{in_progress} running, {passed} passed"
         return "⏳", f"CI: {in_progress} running / {total}", long
+    if cancelled:
+        long = f"{cancelled} cancelled, {passed} passed"
+        return "🚫", f"CI: {cancelled} cancelled / {total}", long
     return "✅", f"CI: {passed}/{total} passed", f"All {total} checks passed"
 
 
@@ -315,6 +327,19 @@ async def handle_check_suite(payload: dict) -> None:
 # ── Deployment Status ─────────────────────────────────────
 
 
+_ACTIONS_JOB_URL = re.compile(r"/actions/runs/\d+/job/(\d+)")
+
+
+async def _deploy_job_was_cancelled(installation_id: int, repo: str, log_url: str | None) -> bool:
+    """True when the deployment status came from a GitHub Actions job that was
+    cancelled. Non-Actions deployers (no job URL) are never treated as cancelled."""
+    m = _ACTIONS_JOB_URL.search(log_url or "")
+    if not m:
+        return False
+    job = await github_service.get_workflow_job(installation_id, repo, int(m.group(1)))
+    return job.get("conclusion") == "cancelled"
+
+
 async def handle_deployment_status(payload: dict) -> None:
     deployment = payload["deployment"]
     deployment_status = payload["deployment_status"]
@@ -330,6 +355,16 @@ async def handle_deployment_status(payload: dict) -> None:
     if ref != default_branch:
         return
 
+    # log_url is the modern field; target_url is the legacy alias.
+    log_url = deployment_status.get("log_url") or deployment_status.get("target_url")
+
+    # GitHub Actions reports a cancelled deploy job (e.g. superseded by a newer
+    # push in the same concurrency group) as state "error". That never
+    # validated anything, so don't raise it as a broken deployment.
+    if state == "error" and await _deploy_job_was_cancelled(installation_id, repo, log_url):
+        logger.info("Skipping deployment alert for %s: job was cancelled (%s)", repo, log_url)
+        return
+
     environment = deployment.get("environment", "unknown")
     creator = (deployment.get("creator") or {}).get("login")
     description = deployment_status.get("description", "")
@@ -343,8 +378,6 @@ async def handle_deployment_status(payload: dict) -> None:
 
     creator_label = creator or "unknown"
 
-    # log_url is the modern field; target_url is the legacy alias.
-    log_url = deployment_status.get("log_url") or deployment_status.get("target_url")
     sha = deployment.get("sha")
     sha_link = f"<https://github.com/{repo}/commit/{sha}|{sha[:7]}>" if sha else (ref or "unknown")
 
