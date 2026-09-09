@@ -103,6 +103,139 @@ async def test_check_suite_alerts_on_manual_dispatch():
         post.assert_called_once()
 
 
+async def test_check_suite_ignores_cancelled_run_on_default_branch():
+    """A run cancelled on the default branch (by hand or by a concurrency
+    group) never produced a verdict, so no failure alert should fire."""
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _patches(run_event="push"):
+            p.start()
+        try:
+            await notification_service.handle_check_suite(
+                _check_suite_payload(conclusion="cancelled")
+            )
+        finally:
+            patch.stopall()
+        post.assert_not_called()
+
+
+# ── Deployment status ─────────────────────────────────────
+
+_JOB_URL = "https://github.com/acme/example-repo/actions/runs/33605621893/job/100168809881"
+
+
+def _deployment_status_payload(state, log_url=_JOB_URL):
+    return {
+        "deployment": {
+            "ref": "main",
+            "sha": _HEAD_SHA,
+            "environment": "dev",
+            "creator": {"login": "alice"},
+        },
+        "deployment_status": {"state": state, "description": "", "log_url": log_url},
+        "repository": {"full_name": "acme/example-repo", "default_branch": "main"},
+        "installation": {"id": 42},
+    }
+
+
+def _deployment_patches(job_conclusion):
+    return [
+        patch.object(
+            notification_service, "get_org_by_installation", new=AsyncMock(return_value=_ORG)
+        ),
+        patch.object(
+            notification_service, "_mention_for_github_login", new=AsyncMock(return_value=None)
+        ),
+        patch.object(
+            notification_service.github_service,
+            "get_workflow_job",
+            new=AsyncMock(return_value={"conclusion": job_conclusion}),
+        ),
+    ]
+
+
+async def test_deployment_error_from_cancelled_job_is_silent():
+    """Two deploys to main in quick succession: the concurrency group cancels
+    the first, and GitHub reports its deployment as state "error"."""
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _deployment_patches(job_conclusion="cancelled"):
+            p.start()
+        try:
+            await notification_service.handle_deployment_status(_deployment_status_payload("error"))
+        finally:
+            patch.stopall()
+        post.assert_not_called()
+
+
+async def test_deployment_failure_still_alerts():
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        for p in _deployment_patches(job_conclusion="failure"):
+            p.start()
+        try:
+            await notification_service.handle_deployment_status(
+                _deployment_status_payload("failure")
+            )
+        finally:
+            patch.stopall()
+        post.assert_called_once()
+        assert "failure" in post.call_args.args[1]
+
+
+async def test_deployment_error_without_actions_job_still_alerts():
+    """Third-party deployers have no Actions job to consult; error stays error."""
+    with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
+        patches = _deployment_patches(job_conclusion="cancelled")
+        mocks = [p.start() for p in patches]
+        try:
+            await notification_service.handle_deployment_status(
+                _deployment_status_payload("error", log_url="https://deployer.example/123")
+            )
+        finally:
+            patch.stopall()
+        post.assert_called_once()
+        mocks[-1].assert_not_called()
+
+
+# ── Check-run rollups ─────────────────────────────────────
+
+
+def _run(conclusion, status="completed", name="build"):
+    return {"name": name, "status": status, "conclusion": conclusion}
+
+
+def test_cancelled_run_is_not_a_failure_in_the_rollup():
+    emoji, title, long = notification_service._aggregate_check_state(
+        [_run("success", name="lint"), _run("cancelled")]
+    )
+    assert emoji == "🚫"
+    assert title == "CI: 1 cancelled / 2"
+    assert long == "1 cancelled, 1 passed"
+
+
+def test_stale_run_is_not_a_failure_in_the_rollup():
+    emoji, _, _ = notification_service._aggregate_check_state([_run("stale")])
+    assert emoji == "🚫"
+
+
+def test_real_failure_still_outranks_cancellation():
+    emoji, title, _ = notification_service._aggregate_check_state(
+        [_run("cancelled"), _run("failure", name="test")]
+    )
+    assert emoji == "❌"
+    assert title == "CI: 1 failed / 2"
+
+
+def test_cancelled_suite_yields_no_recap_state():
+    """Cancellation is neither a pass nor a fail, so it must not flip the PR's
+    last CI state or post a recap."""
+    runs = [_run("success", name="lint"), _run("cancelled")]
+    assert notification_service._completion_state(runs) is None
+
+
+def test_failed_suite_with_cancelled_sibling_is_still_failed():
+    runs = [_run("cancelled"), _run("failure", name="test")]
+    assert notification_service._completion_state(runs) == "failed"
+
+
 # ── Stale PR reminders ────────────────────────────────────
 
 
