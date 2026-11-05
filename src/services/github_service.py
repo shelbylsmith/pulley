@@ -100,6 +100,37 @@ async def get_pull_request_reviews(installation_id: int, repo: str, pr_number: i
     return resp.json()
 
 
+async def get_pull_request_review(
+    installation_id: int, repo: str, pr_number: int, review_id: int
+) -> dict:
+    resp = await github_request(
+        "GET", f"/repos/{repo}/pulls/{pr_number}/reviews/{review_id}", installation_id
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def get_review_comments(
+    installation_id: int, repo: str, pr_number: int, review_id: int
+) -> list[dict]:
+    """The inline comments submitted with one review, oldest first."""
+    comments: list[dict] = []
+    page = 1
+    while True:
+        resp = await github_request(
+            "GET",
+            f"/repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments"
+            f"?per_page=100&page={page}",
+            installation_id,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        comments.extend(batch)
+        if len(batch) < 100:
+            return comments
+        page += 1
+
+
 async def create_issue_comment(
     installation_id: int, repo: str, issue_number: int, body: str
 ) -> dict:

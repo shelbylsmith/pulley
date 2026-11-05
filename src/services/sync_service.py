@@ -11,6 +11,7 @@ import logging
 
 import slack_sdk.errors
 
+from src.config import settings
 from src.db.queries import (
     create_message_mapping,
     create_thread_mapping,
@@ -38,6 +39,8 @@ from src.services.github_service import (
     delete_issue_comment_as_user,
     delete_review_comment,
     delete_review_comment_as_user,
+    get_pull_request_review,
+    get_review_comments,
     get_valid_user_token,
     reply_to_review_comment_as_user,
     update_issue_comment,
@@ -161,6 +164,8 @@ async def handle_pr_review(payload: dict) -> None:
             origin="github",
             slack_ts_extra=ts_list[1:],
         )
+        if settings.collapse_review_comments and body and org:
+            await _post_review_comments_in_thread(db_pr, org, review, ts_list[0], token)
 
     # Update the org-level digest with the new review state
 
@@ -170,6 +175,80 @@ async def handle_pr_review(payload: dict) -> None:
             await pr_digest_service.update(db_pr.github_pr_id, org)
 
     logger.info("Review %s by %s on %s#%d", state, reviewer, repo, pr_number)
+
+
+async def _post_review_comments_in_thread(
+    db_pr, org, review: dict, thread_ts: str, token: str | None
+) -> None:
+    """Post a review's inline comments as replies under its summary message.
+
+    `handle_review_comment` skips these comments (see `_collapsed_into_review`),
+    so this is their only path into Slack. Each one maps its GitHub thread to
+    the summary's Slack thread, so later GitHub replies land there too.
+    """
+    try:
+        comments = await get_review_comments(
+            org.github_installation_id, db_pr.repo_full_name, db_pr.github_pr_number, review["id"]
+        )
+    except Exception:  # noqa: BLE001 — the summary is posted; don't fail the webhook
+        logger.exception("Could not list the comments of review %s", review["id"])
+        return
+
+    for comment in comments:
+        body = comment.get("body") or ""
+        # A reply to an older thread arrives via handle_review_comment, which
+        # posts it into that thread.
+        if comment.get("in_reply_to_id") or SYNC_TAG in body:
+            continue
+        body_slack = await github_body_to_slack(body) if body else ""
+        message = _render_review_comment_message(comment, body_slack)
+        ts_list = await _post_attributed_to_github_user(
+            db_pr.slack_channel_id,
+            message,
+            comment["user"]["login"],
+            token,
+            thread_ts=thread_ts,
+        )
+        if not ts_list:
+            continue
+        await create_thread_mapping(
+            pull_request_id=db_pr.id,
+            github_thread_id=str(comment["id"]),
+            slack_channel_id=db_pr.slack_channel_id,
+            slack_thread_ts=thread_ts,
+            file_path=comment.get("path", ""),
+        )
+        await create_message_mapping(
+            pull_request_id=db_pr.id,
+            slack_channel_id=db_pr.slack_channel_id,
+            slack_ts=ts_list[0],
+            github_comment_id=comment["id"],
+            github_comment_type="review_comment",
+            origin="github",
+            slack_ts_extra=ts_list[1:],
+        )
+
+
+async def _collapsed_into_review(comment: dict, repo: str, pr_number: int, db_pr) -> bool:
+    """True when this new thread-root comment belongs to a review with a summary
+    body, so `_post_review_comments_in_thread` posts it under that summary."""
+    if not settings.collapse_review_comments:
+        return False
+    review_id = comment.get("pull_request_review_id")
+    if comment.get("in_reply_to_id") or not review_id:
+        return False
+    org = await get_org(db_pr.organization_id)
+    if not org:
+        return False
+    try:
+        review = await get_pull_request_review(
+            org.github_installation_id, repo, pr_number, review_id
+        )
+    except Exception:  # noqa: BLE001 — fall back to posting the comment on its own
+        logger.exception("Could not read review %s; posting its comment on its own", review_id)
+        return False
+    body = review.get("body") or ""
+    return bool(body) and SYNC_TAG not in body
 
 
 async def handle_pr_review_dismissed(payload: dict) -> None:
@@ -222,6 +301,9 @@ async def handle_review_comment(payload: dict) -> None:
 
     db_pr = await get_pr_by_repo_and_number(repo, pr_number)
     if not db_pr or not db_pr.slack_channel_id:
+        return
+
+    if await _collapsed_into_review(comment, repo, pr_number, db_pr):
         return
 
     org = await get_org(db_pr.organization_id)

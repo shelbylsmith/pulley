@@ -809,13 +809,21 @@ async def get_thread_mapping(pull_request_id: int, github_thread_id: str) -> Thr
 async def get_thread_mapping_by_slack_ts(
     pull_request_id: int, slack_thread_ts: str
 ) -> ThreadMapping | None:
+    """The one GitHub review thread mapped to this Slack thread, or None.
+
+    A collapsed review maps each of its comment threads to the review's Slack
+    thread. A Slack reply there cannot say which comment it answers, so with
+    more than one mapping this returns None and the reply becomes a PR comment.
+    """
     async with _session() as s:
         result = await s.execute(
             select(ThreadMapping)
             .where(ThreadMapping.pull_request_id == pull_request_id)
             .where(ThreadMapping.slack_thread_ts == slack_thread_ts)
+            .limit(2)
         )
-        return result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        return rows[0] if len(rows) == 1 else None
 
 
 async def create_thread_mapping(
