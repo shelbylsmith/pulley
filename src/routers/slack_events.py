@@ -153,6 +153,7 @@ async def _handle_reaction_added(event: dict, team_id: str | None) -> None:
             channel_id=event["item"]["channel"],
             slack_user_id=event["user"],
             team_id=team_id,
+            message_ts=event["item"].get("ts"),
         )
 
 

@@ -7,8 +7,11 @@ Echo prevention: messages originating from the sync are tagged so they can be ig
 when they bounce back through the other platform's webhook.
 """
 
+import asyncio
 import logging
+import time
 
+import httpx
 import slack_sdk.errors
 
 from src.config import settings
@@ -20,8 +23,6 @@ from src.db.queries import (
     get_message_mapping_by_github_comment,
     get_message_mapping_in_channel,
     get_org,
-    get_pr_by_channel,
-    get_pr_by_channel_thread,
     get_pr_by_id,
     get_pr_by_repo_and_number,
     get_slack_ids_for_github_usernames,
@@ -34,6 +35,7 @@ from src.db.queries import (
     set_pr_reviewers,
 )
 from src.services import pr_digest_service, slack_service
+from src.services.channel_target import resolve_channel_pr
 from src.services.github_service import (
     create_issue_comment,
     create_issue_comment_as_user,
@@ -153,24 +155,42 @@ async def handle_pr_review(payload: dict) -> None:
     body_slack = await github_body_to_slack(body) if body else ""
     message = _render_review_message(state, review_url, repo, pr_number, body_slack)
 
-    ts_list = await _post_attributed_to_github_user(
-        db_pr.slack_channel_id, message, reviewer, token, thread_ts=db_pr.slack_thread_ts
-    )
-    if ts_list:
-        await create_message_mapping(
-            pull_request_id=db_pr.id,
-            slack_channel_id=db_pr.slack_channel_id,
-            slack_ts=ts_list[0],
-            github_comment_id=review["id"],
-            github_comment_type="review",
-            origin="github",
-            slack_ts_extra=ts_list[1:],
-        )
-        if settings.collapse_review_comments and body and org:
-            # A stacked PR's review is already a reply, and Slack threads do not
-            # nest, so its comments go in the PR's own thread.
-            thread_ts = db_pr.slack_thread_ts or ts_list[0]
-            await _post_review_comments_in_thread(db_pr, org, review, thread_ts, token)
+    collapse = settings.collapse_review_comments and _review_collapses(body) and org
+    summary_error: Exception | None = None
+    # A redelivered review event finds its summary already posted.
+    summary = await get_message_mapping_by_github_comment(review["id"], "review")
+    summary_ts = summary.slack_ts if summary else None
+    if not summary:
+        try:
+            ts_list = await _post_attributed_to_github_user(
+                db_pr.slack_channel_id, message, reviewer, token, thread_ts=db_pr.slack_thread_ts
+            )
+        except slack_sdk.errors.SlackApiError as e:
+            if not collapse:
+                raise
+            # The review's inline comments still reach Slack below, unthreaded.
+            logger.exception("Could not post the summary of review %s", review["id"])
+            summary_error, ts_list = e, []
+        if ts_list:
+            summary_ts = ts_list[0]
+            await create_message_mapping(
+                pull_request_id=db_pr.id,
+                slack_channel_id=db_pr.slack_channel_id,
+                slack_ts=ts_list[0],
+                github_comment_id=review["id"],
+                github_comment_type="review",
+                origin="github",
+                slack_ts_extra=ts_list[1:],
+            )
+    if collapse:
+        _remember_review_collapses(review["id"], True)
+        # A stacked PR's review is already a reply, and Slack threads do not
+        # nest, so its comments go in the PR's own thread. Without a summary
+        # message they go where they would have gone uncollapsed.
+        thread_ts = db_pr.slack_thread_ts or summary_ts
+        await _post_review_comments_in_thread(db_pr, org, review, thread_ts, token)
+    if summary_error:
+        raise summary_error
 
     # Update the org-level digest with the new review state
 
@@ -182,21 +202,65 @@ async def handle_pr_review(payload: dict) -> None:
     logger.info("Review %s by %s on %s#%d", state, reviewer, repo, pr_number)
 
 
+# GitHub sends each inline comment of a review as its own event, so the same
+# "does this review collapse?" answer is needed once per comment. Cache it per
+# review id for a few minutes rather than refetching the review every time.
+_REVIEW_COLLAPSE_TTL = 600.0
+_review_collapse_cache: dict[int, tuple[float, bool]] = {}
+_REVIEW_COMMENT_FETCH_DELAYS = (0.0, 1.0, 2.0)
+
+
+def _review_collapses(body: str) -> bool:
+    """A review collapses its inline comments under its summary when it has a
+    summary body that did not come from Slack."""
+    return bool(body) and SYNC_TAG not in body
+
+
+def _remember_review_collapses(review_id: int, collapses: bool) -> None:
+    now = time.monotonic()
+    if len(_review_collapse_cache) > 1000:
+        for key, (expires, _) in list(_review_collapse_cache.items()):
+            if expires < now:
+                del _review_collapse_cache[key]
+    _review_collapse_cache[review_id] = (now + _REVIEW_COLLAPSE_TTL, collapses)
+
+
 async def _post_review_comments_in_thread(
-    db_pr, org, review: dict, thread_ts: str, token: str | None
+    db_pr, org, review: dict, thread_ts: str | None, token: str | None
 ) -> None:
     """Post a review's inline comments as replies under its summary message.
 
-    `handle_review_comment` skips these comments (see `_collapsed_into_review`),
-    so this is their only path into Slack. Each one maps its GitHub thread to
-    the summary's Slack thread, so later GitHub replies land there too.
+    `handle_review_comment` skips the thread-root comments of a collapsing
+    review, so this is their path into Slack. It lists them from the API rather
+    than waiting for their events, because those can arrive before or after the
+    review event. Comments that already have a Slack message are skipped, so a
+    redelivered review, or a comment that `handle_review_comment` posted on its
+    own, is not posted twice. Each comment maps its GitHub thread to the
+    summary's Slack thread, so later GitHub replies land there too.
     """
-    try:
-        comments = await get_review_comments(
-            org.github_installation_id, db_pr.repo_full_name, db_pr.github_pr_number, review["id"]
+    comments: list[dict] | None = None
+    for delay in _REVIEW_COMMENT_FETCH_DELAYS:
+        await asyncio.sleep(delay)
+        try:
+            comments = await get_review_comments(
+                org.github_installation_id,
+                db_pr.repo_full_name,
+                db_pr.github_pr_number,
+                review["id"],
+            )
+            break
+        except httpx.HTTPError:
+            logger.warning("Listing the comments of review %s failed", review["id"], exc_info=True)
+    if comments is None:
+        # Say so in Slack rather than drop the comments without a trace.
+        await slack_service.post_message(
+            db_pr.slack_channel_id,
+            f"⚠️ Pulley could not load this review's inline comments. "
+            f"<{review['html_url']}|Read them on GitHub>.",
+            thread_ts=thread_ts,
+            token=token,
         )
-    except Exception:  # noqa: BLE001 — the summary is posted; don't fail the webhook
-        logger.exception("Could not list the comments of review %s", review["id"])
+        logger.error("Gave up listing the comments of review %s", review["id"])
         return
 
     for comment in comments:
@@ -204,6 +268,8 @@ async def _post_review_comments_in_thread(
         # A reply to an older thread arrives via handle_review_comment, which
         # posts it into that thread.
         if comment.get("in_reply_to_id") or SYNC_TAG in body:
+            continue
+        if await get_message_mapping_by_github_comment(comment["id"], "review_comment"):
             continue
         body_slack = await github_body_to_slack(body) if body else ""
         message = _render_review_comment_message(comment, body_slack)
@@ -220,7 +286,7 @@ async def _post_review_comments_in_thread(
             pull_request_id=db_pr.id,
             github_thread_id=str(comment["id"]),
             slack_channel_id=db_pr.slack_channel_id,
-            slack_thread_ts=thread_ts,
+            slack_thread_ts=thread_ts or ts_list[0],
             file_path=comment.get("path", ""),
         )
         await create_message_mapping(
@@ -235,13 +301,18 @@ async def _post_review_comments_in_thread(
 
 
 async def _collapsed_into_review(comment: dict, repo: str, pr_number: int, db_pr) -> bool:
-    """True when this new thread-root comment belongs to a review with a summary
-    body, so `_post_review_comments_in_thread` posts it under that summary."""
+    """True when this new thread-root comment belongs to a review that
+    collapses, so `_post_review_comments_in_thread` posts it under that review's
+    summary. When the review cannot be read, the comment is posted on its own;
+    the review handler then skips it, so it appears once either way."""
     if not settings.collapse_review_comments:
         return False
     review_id = comment.get("pull_request_review_id")
     if comment.get("in_reply_to_id") or not review_id:
         return False
+    cached = _review_collapse_cache.get(review_id)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
     org = await get_org(db_pr.organization_id)
     if not org:
         return False
@@ -249,11 +320,29 @@ async def _collapsed_into_review(comment: dict, repo: str, pr_number: int, db_pr
         review = await get_pull_request_review(
             org.github_installation_id, repo, pr_number, review_id
         )
-    except Exception:  # noqa: BLE001 — fall back to posting the comment on its own
-        logger.exception("Could not read review %s; posting its comment on its own", review_id)
+    except httpx.HTTPError:
+        logger.warning(
+            "Could not read review %s; posting its comment on its own", review_id, exc_info=True
+        )
         return False
-    body = review.get("body") or ""
-    return bool(body) and SYNC_TAG not in body
+    collapses = _review_collapses(review.get("body") or "")
+    _remember_review_collapses(review_id, collapses)
+    return collapses
+
+
+# A reply can arrive before the review event has mapped the thread it answers
+# (an in-review reply, or a quick reply to a collapsed comment). Wait briefly
+# for that mapping rather than start a second Slack thread.
+_THREAD_MAPPING_WAITS = (1.0, 1.0, 2.0)
+
+
+async def _await_thread_mapping(pull_request_id: int, github_thread_id: str):
+    for delay in _THREAD_MAPPING_WAITS:
+        await asyncio.sleep(delay)
+        mapping = await get_thread_mapping(pull_request_id, github_thread_id)
+        if mapping:
+            return mapping
+    return None
 
 
 async def handle_pr_review_dismissed(payload: dict) -> None:
@@ -327,6 +416,8 @@ async def handle_review_comment(payload: dict) -> None:
 
     # Check if we already have a Slack thread for this conversation
     mapping = await get_thread_mapping(db_pr.id, github_thread_id)
+    if not mapping and in_reply_to and settings.collapse_review_comments:
+        mapping = await _await_thread_mapping(db_pr.id, github_thread_id)
 
     ts_list: list[str] = []
 
@@ -636,12 +727,27 @@ async def handle_slack_message(
     if text.startswith(SLACK_SYNC_PREFIX):
         return
 
-    # A reply under a stacked PR's parent message belongs to that PR; anything
-    # else in the channel belongs to the PR that owns the channel.
-    stacked = await get_pr_by_channel_thread(channel_id, thread_ts) if thread_ts else None
-    db_pr = stacked or await get_pr_by_channel(channel_id)
+    # A thread reply belongs to the PR its thread is about: a stacked PR's
+    # parent message, or a message mapped to a PR's comment. A top-level
+    # message belongs to the channel's owner while it is open.
+    target = await resolve_channel_pr(channel_id, message_ts=thread_ts)
+    db_pr = target.pr
+    if target.ambiguous:
+        # The owner is closed and several stacked PRs are open: there is no
+        # PR to send this to. Say so rather than drop it.
+        org = await get_org(target.open_prs[0].organization_id)
+        numbers = ", ".join(f"#{p.github_pr_number}" for p in target.open_prs)
+        await slack_service.post_message(
+            channel_id,
+            f"This message did not reach GitHub: this channel holds several open PRs "
+            f"({numbers}). Reply in a PR's thread to comment on it.",
+            thread_ts=message_ts,
+            token=org.slack_bot_token if org else None,
+        )
+        return
     if not db_pr:
         return
+    stacked = bool(thread_ts) and db_pr.slack_thread_ts == thread_ts
 
     user = await get_user_by_slack_id(slack_user_id)
 

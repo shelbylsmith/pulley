@@ -1,10 +1,12 @@
 """Tests for /pulley settings: channel parsing and the documented responses."""
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from src.services import command_service
+from src.services.channel_target import ChannelTarget
 
 
 def make_org(**overrides):
@@ -163,3 +165,74 @@ async def test_missing_org_does_not_write(org_and_writes):
 
     assert org_and_writes.writes == []
     assert "not connected" in result["text"].lower()
+
+
+# ── Commands in a stack's channel ─────────────────────────
+
+
+def test_a_leading_hash_number_names_a_pr():
+    assert command_service._split_pr_number("#12 squash") == (12, "squash")
+    assert command_service._split_pr_number("2 nits, ship it") == (None, "2 nits, ship it")
+    assert command_service._split_pr_number("") == (None, "")
+
+
+async def test_merge_in_an_ambiguous_channel_asks_for_a_pr():
+    open_prs = [SimpleNamespace(github_pr_number=6), SimpleNamespace(github_pr_number=7)]
+    with (
+        patch.object(
+            command_service,
+            "resolve_channel_pr",
+            new=AsyncMock(return_value=ChannelTarget(None, open_prs)),
+        ),
+        patch.object(command_service, "merge_pull_request", new=AsyncMock()) as merge,
+    ):
+        reply = await command_service._cmd_merge("C1", "U1", "squash")
+    merge.assert_not_awaited()
+    assert reply["response_type"] == "ephemeral"
+    assert "#6, #7" in reply["text"]
+
+
+async def test_merge_names_the_pr_and_method():
+    pr = SimpleNamespace(
+        github_pr_number=7, state="open", organization_id=1, repo_full_name="org/repo"
+    )
+    with (
+        patch.object(
+            command_service, "resolve_channel_pr", new=AsyncMock(return_value=ChannelTarget(pr))
+        ) as resolve,
+        patch.object(
+            command_service,
+            "get_org",
+            new=AsyncMock(return_value=SimpleNamespace(github_installation_id=5)),
+        ),
+        patch.object(command_service, "merge_pull_request", new=AsyncMock()) as merge,
+    ):
+        await command_service._cmd_merge("C1", "U1", "#7 squash")
+    resolve.assert_awaited_once_with("C1", pr_number=7, strict=True)
+    merge.assert_awaited_once_with(5, "org/repo", 7, "squash")
+
+
+async def test_merge_refuses_a_closed_pr():
+    pr = SimpleNamespace(github_pr_number=5, state="merged")
+    with (
+        patch.object(
+            command_service, "resolve_channel_pr", new=AsyncMock(return_value=ChannelTarget(pr))
+        ),
+        patch.object(command_service, "merge_pull_request", new=AsyncMock()) as merge,
+    ):
+        reply = await command_service._cmd_merge("C1", "U1", "")
+    merge.assert_not_awaited()
+    assert "already merged" in reply["text"]
+
+
+async def test_lgtm_refuses_a_closed_pr():
+    pr = SimpleNamespace(github_pr_number=5, state="merged")
+    with (
+        patch.object(
+            command_service, "resolve_channel_pr", new=AsyncMock(return_value=ChannelTarget(pr))
+        ),
+        patch.object(command_service, "create_review_as_user", new=AsyncMock()) as approve,
+    ):
+        reply = await command_service.handle_lgtm("C1", "U1", "T1", "")
+    approve.assert_not_awaited()
+    assert "nothing to approve" in reply["text"]

@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # stacked PR) shares that PR's channel instead of getting its own. It gets
     # one parent message there, and all its activity goes into that thread.
     stack_channels: bool = False
+    # Head branches that never count as a stack parent, comma-separated, with
+    # fnmatch wildcards. Long-lived PRs (develop -> main, release/x -> main)
+    # would otherwise pull every PR that targets them into one channel. The
+    # repository's default branch is always excluded.
+    stack_parent_excluded_branches: str = "main,master,develop,dev,staging,production,release/*"
 
     @property
     def base_url(self) -> str:

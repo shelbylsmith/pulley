@@ -1,4 +1,5 @@
-"""stacked PRs share a channel: non-unique slack_channel_id, slack_thread_ts
+"""stacked PRs share a channel: non-unique slack_channel_id, slack_thread_ts,
+head_repo_full_name
 
 Revision ID: a4f6c2e8d1b7
 Revises: e7b2f4a16c83
@@ -23,9 +24,15 @@ def upgrade() -> None:
         "ix_pull_requests_slack_channel_id", "pull_requests", ["slack_channel_id"], unique=False
     )
     op.add_column("pull_requests", sa.Column("slack_thread_ts", sa.String(64), nullable=True))
+    op.add_column("pull_requests", sa.Column("head_repo_full_name", sa.String(255), nullable=True))
 
 
 def downgrade() -> None:
+    # Stacked PRs share their stack's channel id. Detach them so the unique
+    # index below can be built; they lose their Slack link, as they would have
+    # had without stack channels.
+    op.execute("UPDATE pull_requests SET slack_channel_id = NULL WHERE slack_thread_ts IS NOT NULL")
+    op.drop_column("pull_requests", "head_repo_full_name")
     op.drop_column("pull_requests", "slack_thread_ts")
     op.drop_index("ix_pull_requests_slack_channel_id", table_name="pull_requests")
     op.create_index(

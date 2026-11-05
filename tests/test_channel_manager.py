@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 import slack_sdk.errors
 
 from src.services import channel_manager
@@ -436,20 +437,24 @@ async def _close(db_pr, remaining: int):
         patch.object(channel_manager.pr_digest_service, "update", new=AsyncMock()),
         patch.object(channel_manager.slack_service, "post_message", new=AsyncMock()) as post,
         patch.object(channel_manager.slack_service, "archive_channel", new=AsyncMock()) as archive,
+        patch.object(channel_manager, "set_channel_archived", new=AsyncMock()) as recorded,
     ):
         await channel_manager.handle_pr_closed(_closed_payload())
-    return post, archive
+    return post, archive, recorded
 
 
 async def test_closing_a_pr_keeps_the_channel_while_its_stack_is_open():
-    post, archive = await _close(_STACKED, remaining=2)
+    post, archive, recorded = await _close(_STACKED, remaining=2)
     archive.assert_not_awaited()
+    # The channel stays active, so its row must not say archived.
+    recorded.assert_not_awaited()
     assert post.await_args.kwargs["thread_ts"] == "200.1"
 
 
 async def test_closing_the_last_open_pr_archives_the_channel():
-    post, archive = await _close(_DB_PR, remaining=0)
+    post, archive, recorded = await _close(_DB_PR, remaining=0)
     archive.assert_awaited_once_with("C123", token="xoxb")
+    recorded.assert_awaited_once_with("C123", True)
     assert post.await_args.kwargs["thread_ts"] is None
 
 
@@ -487,3 +492,126 @@ async def test_renaming_a_stacked_pr_leaves_the_channel_topic_alone():
         assert channel_manager.slack_service.post_message.await_args.kwargs["thread_ts"] == "200.1"
     finally:
         patch.stopall()
+
+
+async def test_reopening_a_pr_records_its_channel_as_active():
+    payload = {
+        "pull_request": {"id": 999, "number": 42},
+        "repository": {"full_name": "org/repo"},
+    }
+    with (
+        patch.object(channel_manager, "get_pr_by_github_id", new=AsyncMock(return_value=_STACKED)),
+        patch.object(channel_manager, "reopen_pr", new=AsyncMock(return_value=_STACKED)),
+        patch.object(channel_manager, "get_org", new=AsyncMock(return_value=_ORG)),
+        patch.object(channel_manager.slack_service, "unarchive_channel", new=AsyncMock()),
+        patch.object(channel_manager.slack_service, "post_message", new=AsyncMock()),
+        patch.object(channel_manager.pr_digest_service, "update", new=AsyncMock()),
+        patch.object(channel_manager, "set_channel_archived", new=AsyncMock()) as recorded,
+    ):
+        await channel_manager.handle_pr_reopened(payload)
+    recorded.assert_awaited_once_with("C_STACK", False)
+
+
+def _repo(default_branch: str = "main") -> dict:
+    return {"repository": {"default_branch": default_branch}}
+
+
+def test_a_feature_branch_can_be_a_stack_parent():
+    assert channel_manager._can_stack_on(_repo(), "feat/parent")
+
+
+def test_the_default_branch_is_never_a_stack_parent():
+    assert not channel_manager._can_stack_on(_repo("trunk"), "trunk")
+
+
+def test_long_lived_branches_are_never_stack_parents():
+    for branch in ("develop", "release/1.4", "main"):
+        assert not channel_manager._can_stack_on(_repo("trunk"), branch), branch
+
+
+def test_excluded_branches_are_configurable():
+    with patch.object(channel_manager.settings, "stack_parent_excluded_branches", "env/*"):
+        assert not channel_manager._can_stack_on(_repo(), "env/prod")
+        assert channel_manager._can_stack_on(_repo(), "develop")
+
+
+async def test_pr_on_a_long_lived_branch_gets_its_own_channel():
+    payload = _opened_payload()
+    payload["pull_request"]["base"] = {"ref": "develop"}
+    for p in _stack_patches(_PARENT):
+        p.start()
+    try:
+        await channel_manager.handle_pr_opened(payload)
+        channel_manager.get_stack_parent.assert_not_awaited()
+        channel_manager.slack_service.create_channel.assert_awaited_once()
+    finally:
+        patch.stopall()
+
+
+async def test_tracked_prs_record_their_head_repository():
+    payload = _opened_payload()
+    payload["pull_request"]["base"] = {"ref": "feat/parent"}
+    payload["pull_request"]["head"] = {"ref": "main", "repo": {"full_name": "someone/fork"}}
+    for p in _stack_patches(_PARENT):
+        p.start()
+    try:
+        await channel_manager.handle_pr_opened(payload)
+        created = channel_manager.create_pr_and_channel.await_args.kwargs
+        # get_stack_parent matches only parents whose head is in this repo.
+        assert created["head_repo_full_name"] == "someone/fork"
+    finally:
+        patch.stopall()
+
+
+async def test_failed_stack_join_removes_its_parent_message():
+    payload = _opened_payload()
+    payload["pull_request"]["base"] = {"ref": "feat/parent"}
+    patches = _stack_patches(_PARENT)
+    patches.append(
+        patch.object(
+            channel_manager, "create_pr_and_channel", new=AsyncMock(side_effect=RuntimeError("db"))
+        )
+    )
+    patches.append(patch.object(channel_manager.slack_service, "delete_message", new=AsyncMock()))
+    for p in patches:
+        p.start()
+    try:
+        with pytest.raises(RuntimeError):
+            await channel_manager.handle_pr_opened(payload)
+        channel_manager.slack_service.delete_message.assert_awaited_once_with(
+            "C_STACK", "200.1", token=_OPEN_ORG.slack_bot_token
+        )
+        # Invites run after the row exists, so a failed write invites nobody.
+        channel_manager.get_slack_ids_for_github_usernames.assert_not_awaited()
+    finally:
+        patch.stopall()
+
+
+async def test_blank_channel_label_means_no_gate():
+    with (
+        patch.object(channel_manager.settings, "slack_channel_label", "  "),
+        patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel,
+    ):
+        await channel_manager.handle_pr_opened(_opened_payload())
+    open_channel.assert_awaited_once()
+
+
+async def test_reaction_on_a_stacked_prs_parent_assigns_that_pr():
+    stacked = SimpleNamespace(**{**vars(_STACKED), "state": "open"})
+    user = SimpleNamespace(github_username="bob")
+    org = SimpleNamespace(slack_bot_token="xoxb", github_installation_id=555)
+    with (
+        patch.object(
+            channel_manager,
+            "resolve_channel_pr",
+            new=AsyncMock(return_value=SimpleNamespace(pr=stacked)),
+        ) as resolve,
+        patch.object(channel_manager, "get_user_by_slack_id", new=AsyncMock(return_value=user)),
+        patch.object(channel_manager, "get_org", new=AsyncMock(return_value=org)),
+        patch.object(channel_manager, "github_request", new=AsyncMock()) as gh,
+        patch.object(channel_manager.slack_service, "post_message", new=AsyncMock()) as post,
+    ):
+        await channel_manager.handle_reaction_reviewer("C_STACK", "U1", "T1", message_ts="200.1")
+    resolve.assert_awaited_once_with("C_STACK", message_ts="200.1")
+    assert gh.await_args.args[1] == "/repos/org/repo/pulls/42/requested_reviewers"
+    assert post.await_args.kwargs["thread_ts"] == "200.1"

@@ -22,6 +22,9 @@ class PullRequest(Base):
     state: Mapped[str] = mapped_column(String(32), default="open")  # open, closed, merged
     is_draft: Mapped[bool] = mapped_column(Boolean, default=False)
     head_branch: Mapped[str] = mapped_column(String(255))
+    # The repository the head branch lives in. Differs from repo_full_name for
+    # a PR from a fork, whose head branch is not a branch of this repository.
+    head_repo_full_name: Mapped[str | None] = mapped_column(String(255))
     base_branch: Mapped[str] = mapped_column(String(255))
     html_url: Mapped[str] = mapped_column(Text)
 

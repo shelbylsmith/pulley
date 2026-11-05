@@ -8,10 +8,10 @@ from src.db.queries import (
     get_open_prs_for_author,
     get_open_prs_for_org,
     get_org,
-    get_pr_by_channel,
     get_user_by_slack_id,
 )
 from src.services import slack_service
+from src.services.channel_target import ambiguity_hint, resolve_channel_pr
 from src.services.github_service import (
     create_review_as_user,
     get_valid_user_token,
@@ -27,10 +27,19 @@ async def handle_lgtm(
     team_id: str,
     comment: str,
 ) -> dict:
-    """/lgtm — approve the PR associated with this channel."""
-    db_pr = await get_pr_by_channel(channel_id)
+    """/lgtm [#N] [comment] — approve the PR associated with this channel."""
+    pr_number, comment = _split_pr_number(comment)
+    target = await resolve_channel_pr(channel_id, pr_number=pr_number, strict=True)
+    if target.ambiguous:
+        return {"response_type": "ephemeral", "text": ambiguity_hint(target, "/lgtm #N")}
+    db_pr = target.pr
     if not db_pr:
         return {"response_type": "ephemeral", "text": "This channel isn't linked to a PR."}
+    if db_pr.state != "open":
+        return {
+            "response_type": "ephemeral",
+            "text": f"#{db_pr.github_pr_number} is {db_pr.state}; there is nothing to approve.",
+        }
 
     user = await get_user_by_slack_id(slack_user_id)
     if not user:
@@ -67,6 +76,7 @@ async def handle_lgtm(
     await slack_service.post_message(
         channel_id,
         f"✅ *{user.github_username}* approved this PR",
+        thread_ts=db_pr.slack_thread_ts,
         token=org.slack_bot_token,
     )
 
@@ -76,7 +86,19 @@ async def handle_lgtm(
         db_pr.repo_full_name,
         db_pr.github_pr_number,
     )
-    return {"response_type": "in_channel", "text": f"✅ <@{slack_user_id}> approved this PR"}
+    return {
+        "response_type": "in_channel",
+        "text": f"✅ <@{slack_user_id}> approved #{db_pr.github_pr_number}",
+    }
+
+
+def _split_pr_number(text: str) -> tuple[int | None, str]:
+    """Split a leading `#123` off a command's text. The `#` is required, so a
+    comment that starts with a number stays a comment."""
+    head, _, rest = text.strip().partition(" ")
+    if head.startswith("#") and head[1:].isdigit():
+        return int(head[1:]), rest.strip()
+    return None, text.strip()
 
 
 async def handle_pulley_command(
@@ -174,14 +196,27 @@ async def _cmd_team(team_name: str, team_id: str) -> dict:
     return {"response_type": "ephemeral", "text": "\n".join(lines)}
 
 
-async def _cmd_merge(channel_id: str, slack_user_id: str, method: str) -> dict:
-    merge_method = method.strip().lower() if method else "merge"
+async def _cmd_merge(channel_id: str, slack_user_id: str, arg: str) -> dict:
+    """/pulley merge [#N] [merge|squash|rebase]"""
+    pr_number, method = _split_pr_number(arg)
+    merge_method = method.lower() if method else "merge"
     if merge_method not in ("merge", "squash", "rebase"):
         merge_method = "merge"
 
-    db_pr = await get_pr_by_channel(channel_id)
+    target = await resolve_channel_pr(channel_id, pr_number=pr_number, strict=True)
+    if target.ambiguous:
+        return {
+            "response_type": "ephemeral",
+            "text": ambiguity_hint(target, "/pulley merge #N [merge|squash|rebase]"),
+        }
+    db_pr = target.pr
     if not db_pr:
         return {"response_type": "ephemeral", "text": "This channel isn't linked to a PR."}
+    if db_pr.state != "open":
+        return {
+            "response_type": "ephemeral",
+            "text": f"#{db_pr.github_pr_number} is already {db_pr.state}.",
+        }
 
     org = await get_org(db_pr.organization_id)
     if not org:
@@ -202,7 +237,7 @@ async def _cmd_merge(channel_id: str, slack_user_id: str, method: str) -> dict:
     )
     return {
         "response_type": "in_channel",
-        "text": f"🔀 <@{slack_user_id}> merged this PR ({merge_method})",
+        "text": f"🔀 <@{slack_user_id}> merged #{db_pr.github_pr_number} ({merge_method})",
     }
 
 
@@ -344,9 +379,9 @@ def _cmd_help() -> dict:
             "• `/pulley open` — list all open PRs\n"
             "• `/pulley me` — list your open PRs\n"
             "• `/pulley team <name>` — list PRs for a team\n"
-            "• `/pulley merge [method]` — merge this PR (merge/squash/rebase)\n"
+            "• `/pulley merge [#N] [method]` — merge this PR (merge/squash/rebase)\n"
             "• `/pulley settings` — show which channels Pulley posts to\n"
             "• `/pulley settings pr|ci|issues|recap #channel` — change one of them\n"
-            "• `/lgtm [comment]` — approve this PR"
+            "• `/lgtm [#N] [comment]` — approve this PR"
         ),
     }
