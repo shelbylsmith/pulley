@@ -22,6 +22,9 @@ class PullRequest(Base):
     state: Mapped[str] = mapped_column(String(32), default="open")  # open, closed, merged
     is_draft: Mapped[bool] = mapped_column(Boolean, default=False)
     head_branch: Mapped[str] = mapped_column(String(255))
+    # The repository the head branch lives in. Differs from repo_full_name for
+    # a PR from a fork, whose head branch is not a branch of this repository.
+    head_repo_full_name: Mapped[str | None] = mapped_column(String(255))
     base_branch: Mapped[str] = mapped_column(String(255))
     html_url: Mapped[str] = mapped_column(Text)
 
@@ -30,7 +33,11 @@ class PullRequest(Base):
     author_github_username: Mapped[str] = mapped_column(String(255))
 
     # Slack channel
-    slack_channel_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # Not unique: with STACK_CHANNELS, a stacked PR shares its stack's channel.
+    slack_channel_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    # A stacked PR's parent message in the shared channel; everything about the
+    # PR is posted in that thread. None for a PR that owns its channel.
+    slack_thread_ts: Mapped[str | None] = mapped_column(String(64))
     no_slack_channel: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Bookmark in the PR's Slack channel showing rolled-up CI state

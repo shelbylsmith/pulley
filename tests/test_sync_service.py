@@ -1,7 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+import pytest
+import slack_sdk.errors
+
 from src.services import sync_service
+from src.services.channel_target import ChannelTarget
 from src.services.sync_service import (
     SLACK_TEXT_LIMIT,
     SYNC_TAG,
@@ -121,10 +126,10 @@ async def test_slack_edit_skips_github_origin_mapping():
     db_pr = SimpleNamespace(id=1, organization_id=10, repo_full_name="org/repo")
     github_origin = SimpleNamespace(origin="github", github_comment_id=5, github_comment_type="x")
     with (
-        patch.object(sync_service, "get_pr_by_channel", new=AsyncMock(return_value=db_pr)),
+        patch.object(sync_service, "get_pr_by_id", new=AsyncMock(return_value=db_pr)),
         patch.object(
             sync_service,
-            "get_message_mapping_by_slack_ts",
+            "get_message_mapping_in_channel",
             new=AsyncMock(return_value=github_origin),
         ),
         patch.object(sync_service, "update_issue_comment_as_user", new=AsyncMock()) as upd_user,
@@ -138,14 +143,14 @@ async def test_slack_edit_skips_github_origin_mapping():
 async def test_slack_edit_updates_github_comment_as_user():
     db_pr = SimpleNamespace(id=1, organization_id=10, repo_full_name="org/repo")
     mapping = SimpleNamespace(
-        origin="slack", github_comment_id=42, github_comment_type="issue_comment"
+        pull_request_id=1, origin="slack", github_comment_id=42, github_comment_type="issue_comment"
     )
     org = SimpleNamespace(slack_bot_token="xoxb", github_installation_id=99)
     user = SimpleNamespace()
     with (
-        patch.object(sync_service, "get_pr_by_channel", new=AsyncMock(return_value=db_pr)),
+        patch.object(sync_service, "get_pr_by_id", new=AsyncMock(return_value=db_pr)),
         patch.object(
-            sync_service, "get_message_mapping_by_slack_ts", new=AsyncMock(return_value=mapping)
+            sync_service, "get_message_mapping_in_channel", new=AsyncMock(return_value=mapping)
         ),
         patch.object(sync_service, "get_org", new=AsyncMock(return_value=org)),
         patch.object(
@@ -168,6 +173,7 @@ async def test_slack_delete_removes_github_comment_and_mapping():
     db_pr = SimpleNamespace(id=1, organization_id=10, repo_full_name="org/repo")
     mapping = SimpleNamespace(
         id=55,
+        pull_request_id=1,
         origin="slack",
         github_comment_id=42,
         github_comment_type="review_comment",
@@ -176,9 +182,9 @@ async def test_slack_delete_removes_github_comment_and_mapping():
     org = SimpleNamespace(github_installation_id=99)
     user = SimpleNamespace()
     with (
-        patch.object(sync_service, "get_pr_by_channel", new=AsyncMock(return_value=db_pr)),
+        patch.object(sync_service, "get_pr_by_id", new=AsyncMock(return_value=db_pr)),
         patch.object(
-            sync_service, "get_message_mapping_by_slack_ts", new=AsyncMock(return_value=mapping)
+            sync_service, "get_message_mapping_in_channel", new=AsyncMock(return_value=mapping)
         ),
         patch.object(sync_service, "get_org", new=AsyncMock(return_value=org)),
         patch.object(sync_service, "get_user_by_slack_id", new=AsyncMock(return_value=user)),
@@ -272,7 +278,9 @@ async def test_review_dismissed_posts_message_and_clears_state():
         "repository": {"full_name": "org/repo"},
         "sender": {"login": "maintainer"},
     }
-    db_pr = SimpleNamespace(organization_id=10, slack_channel_id="C1", github_pr_id=99)
+    db_pr = SimpleNamespace(
+        organization_id=10, slack_channel_id="C1", slack_thread_ts=None, github_pr_id=99
+    )
     org = SimpleNamespace(slack_bot_token="xoxb")
     with (
         patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=db_pr)),
@@ -371,3 +379,394 @@ async def test_review_submit_syncs_reviewers_even_for_sync_tagged_body():
         await sync_service.handle_pr_review(payload)
     set_reviewers.assert_awaited_once_with(99, [])
     get_pr.assert_not_called()
+
+
+# ── Collapsed reviews ─────────────────────────────────────
+
+_C_PR = SimpleNamespace(
+    id=1,
+    organization_id=10,
+    github_pr_id=99,
+    github_pr_number=5,
+    repo_full_name="org/repo",
+    slack_channel_id="C1",
+    slack_thread_ts=None,
+)
+_C_ORG = SimpleNamespace(slack_bot_token="xoxb", github_installation_id=555)
+
+
+def _review_payload(body: str = "Low risk: two minor gaps.") -> dict:
+    return {
+        "review": {
+            "id": 77,
+            "user": {"login": "legacy-pr-review[bot]"},
+            "state": "commented",
+            "body": body,
+            "html_url": "https://gh/r",
+        },
+        "pull_request": {"id": 99, "number": 5, "requested_reviewers": []},
+        "repository": {"full_name": "org/repo"},
+    }
+
+
+def _inline(cid: int, reply_to: int | None = None) -> dict:
+    return {
+        "id": cid,
+        "body": f"finding {cid}",
+        "path": "src/app.py",
+        "line": 3,
+        "diff_hunk": "@@ -1 +1 @@\n+x",
+        "html_url": f"https://gh/c/{cid}",
+        "user": {"login": "legacy-pr-review[bot]"},
+        "pull_request_review_id": 77,
+        "in_reply_to_id": reply_to,
+    }
+
+
+def _collapse_patches(comments: list[dict]) -> list:
+    return [
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "set_pr_reviewers", new=AsyncMock()),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(sync_service, "github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
+        patch.object(sync_service, "get_review_comments", new=AsyncMock(return_value=comments)),
+        patch.object(
+            sync_service,
+            "_post_attributed_to_github_user",
+            new=AsyncMock(side_effect=[["100.1"], ["100.2"], ["100.3"]]),
+        ),
+        patch.object(sync_service, "create_message_mapping", new=AsyncMock()),
+        patch.object(sync_service, "create_thread_mapping", new=AsyncMock()),
+        patch.object(
+            sync_service, "get_message_mapping_by_github_comment", new=AsyncMock(return_value=None)
+        ),
+    ]
+
+
+async def test_collapsed_review_threads_its_comments_under_the_summary():
+    for p in _collapse_patches([_inline(1), _inline(2), _inline(3, reply_to=9)]):
+        p.start()
+    try:
+        await sync_service.handle_pr_review(_review_payload())
+        posts = sync_service._post_attributed_to_github_user.await_args_list
+        # Summary top-level, then the two new threads as replies under it. The
+        # reply to an older thread (3) is left to handle_review_comment.
+        assert len(posts) == 3
+        assert posts[0].kwargs.get("thread_ts") is None
+        assert [c.kwargs["thread_ts"] for c in posts[1:]] == ["100.1", "100.1"]
+        assert "finding 1" in posts[1].args[1]
+        threads = sync_service.create_thread_mapping.await_args_list
+        assert [t.kwargs["github_thread_id"] for t in threads] == ["1", "2"]
+        assert {t.kwargs["slack_thread_ts"] for t in threads} == {"100.1"}
+    finally:
+        patch.stopall()
+
+
+async def test_review_without_body_is_not_collapsed():
+    for p in _collapse_patches([_inline(1)]):
+        p.start()
+    try:
+        await sync_service.handle_pr_review(_review_payload(body=""))
+        sync_service._post_attributed_to_github_user.assert_not_awaited()
+        sync_service.get_review_comments.assert_not_awaited()
+    finally:
+        patch.stopall()
+
+
+async def test_review_comments_are_top_level_when_collapse_is_off():
+    patches = _collapse_patches([_inline(1)])
+    patches[0] = patch.object(sync_service.settings, "collapse_review_comments", False)
+    for p in patches:
+        p.start()
+    try:
+        await sync_service.handle_pr_review(_review_payload())
+        assert sync_service._post_attributed_to_github_user.await_count == 1
+        sync_service.get_review_comments.assert_not_awaited()
+    finally:
+        patch.stopall()
+
+
+def _comment_payload(comment: dict) -> dict:
+    return {
+        "comment": comment,
+        "pull_request": {"number": 5},
+        "repository": {"full_name": "org/repo"},
+    }
+
+
+async def test_comment_of_a_summarised_review_is_left_to_the_review():
+    with (
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service,
+            "get_pull_request_review",
+            new=AsyncMock(return_value={"body": "Low risk"}),
+        ),
+        patch.object(sync_service, "_post_attributed_to_github_user", new=AsyncMock()) as post,
+    ):
+        await sync_service.handle_review_comment(_comment_payload(_inline(1)))
+    post.assert_not_awaited()
+
+
+async def test_lone_inline_comment_still_posts_on_its_own():
+    """A single comment (its review wrapper has no body) keeps today's behaviour."""
+    with (
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service, "get_pull_request_review", new=AsyncMock(return_value={"body": ""})
+        ),
+        patch.object(sync_service, "get_thread_mapping", new=AsyncMock(return_value=None)),
+        patch.object(sync_service, "github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
+        patch.object(
+            sync_service, "_post_attributed_to_github_user", new=AsyncMock(return_value=["1.1"])
+        ) as post,
+        patch.object(sync_service, "create_thread_mapping", new=AsyncMock()),
+        patch.object(sync_service, "create_message_mapping", new=AsyncMock()),
+    ):
+        await sync_service.handle_review_comment(_comment_payload(_inline(1)))
+    post.assert_awaited_once()
+
+
+# ── Stacked PRs in a shared channel ───────────────────────
+
+_S_PR = SimpleNamespace(
+    id=2,
+    organization_id=10,
+    github_pr_id=98,
+    github_pr_number=6,
+    repo_full_name="org/repo",
+    slack_channel_id="C1",
+    slack_thread_ts="200.1",
+)
+
+
+async def test_stacked_pr_review_comment_goes_in_its_thread():
+    with (
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_S_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(sync_service, "get_thread_mapping", new=AsyncMock(return_value=None)),
+        patch.object(sync_service, "github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
+        patch.object(
+            sync_service, "_post_attributed_to_github_user", new=AsyncMock(return_value=["200.5"])
+        ) as post,
+        patch.object(sync_service, "create_thread_mapping", new=AsyncMock()) as thread_map,
+        patch.object(sync_service, "create_message_mapping", new=AsyncMock()),
+    ):
+        await sync_service.handle_review_comment(_comment_payload(_inline(1)))
+    assert post.await_args.kwargs["thread_ts"] == "200.1"
+    # Threads do not nest: later replies continue in the PR's thread.
+    assert thread_map.await_args.kwargs["slack_thread_ts"] == "200.1"
+
+
+async def test_stacked_pr_collapsed_review_comments_go_in_its_thread():
+    patches = _collapse_patches([_inline(1)])
+    patches[2] = patch.object(
+        sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_S_PR)
+    )
+    for p in patches:
+        p.start()
+    try:
+        await sync_service.handle_pr_review(_review_payload())
+        posts = sync_service._post_attributed_to_github_user.await_args_list
+        assert [c.kwargs["thread_ts"] for c in posts] == ["200.1", "200.1"]
+    finally:
+        patch.stopall()
+
+
+async def test_reply_under_a_stacked_prs_parent_message_comments_on_that_pr():
+    user = SimpleNamespace(github_username="alice")
+    with (
+        patch.object(
+            sync_service, "resolve_channel_pr", new=AsyncMock(return_value=ChannelTarget(_S_PR))
+        ) as resolve,
+        patch.object(sync_service, "get_user_by_slack_id", new=AsyncMock(return_value=user)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service, "_slack_text_to_github", new=AsyncMock(side_effect=lambda t, _: t)
+        ),
+        patch.object(sync_service, "get_valid_user_token", new=AsyncMock(return_value="ghtok")),
+        patch.object(sync_service, "get_thread_mapping_by_slack_ts", new=AsyncMock()) as by_ts,
+        patch.object(
+            sync_service, "create_issue_comment_as_user", new=AsyncMock(return_value={"id": 5})
+        ) as comment,
+        patch.object(sync_service, "create_message_mapping", new=AsyncMock()),
+    ):
+        await sync_service.handle_slack_message("C1", "U1", "lgtm", "200.1", "200.9", "T1")
+    resolve.assert_awaited_once_with("C1", message_ts="200.1")
+    by_ts.assert_not_awaited()
+    assert comment.await_args.args[1:3] == ("org/repo", 6)
+
+
+@pytest.fixture(autouse=True)
+def _no_waits_and_a_cold_review_cache():
+    sync_service._review_collapse_cache.clear()
+    with (
+        patch.object(sync_service, "_REVIEW_COMMENT_FETCH_DELAYS", (0.0, 0.0, 0.0)),
+        patch.object(sync_service, "_THREAD_MAPPING_WAITS", (0.0, 0.0, 0.0)),
+    ):
+        yield
+    sync_service._review_collapse_cache.clear()
+
+
+async def test_review_comments_that_cannot_be_listed_leave_a_note():
+    patches = _collapse_patches([])
+    patches[5] = patch.object(
+        sync_service, "get_review_comments", new=AsyncMock(side_effect=httpx.ConnectError("x"))
+    )
+    patches.append(patch.object(sync_service.slack_service, "post_message", new=AsyncMock()))
+    for p in patches:
+        p.start()
+    try:
+        await sync_service.handle_pr_review(_review_payload())
+        assert sync_service.get_review_comments.await_count == 3
+        note = sync_service.slack_service.post_message.await_args
+        assert note.kwargs["thread_ts"] == "100.1"
+        assert "https://gh/r" in note.args[1]
+    finally:
+        patch.stopall()
+
+
+async def test_redelivered_review_posts_nothing_twice():
+    summary = SimpleNamespace(slack_ts="100.1")
+    posted = SimpleNamespace(slack_ts="100.2")
+    patches = _collapse_patches([_inline(1), _inline(2)])
+    patches[-1] = patch.object(
+        sync_service,
+        "get_message_mapping_by_github_comment",
+        new=AsyncMock(
+            side_effect=lambda cid, kind: (
+                summary if kind == "review" else (posted if cid == 1 else None)
+            )
+        ),
+    )
+    for p in patches:
+        p.start()
+    try:
+        await sync_service.handle_pr_review(_review_payload())
+        posts = sync_service._post_attributed_to_github_user.await_args_list
+        # Summary and comment 1 exist already: only comment 2 is posted.
+        assert len(posts) == 1
+        assert "finding 2" in posts[0].args[1]
+        assert posts[0].kwargs["thread_ts"] == "100.1"
+    finally:
+        patch.stopall()
+
+
+async def test_failed_summary_still_posts_the_comments_then_fails():
+    patches = _collapse_patches([_inline(1)])
+    error = slack_sdk.errors.SlackApiError("boom", {"error": "ratelimited"})
+    patches[6] = patch.object(
+        sync_service,
+        "_post_attributed_to_github_user",
+        new=AsyncMock(side_effect=[error, ["100.2"]]),
+    )
+    for p in patches:
+        p.start()
+    try:
+        with pytest.raises(slack_sdk.errors.SlackApiError):
+            await sync_service.handle_pr_review(_review_payload())
+        posts = sync_service._post_attributed_to_github_user.await_args_list
+        assert len(posts) == 2
+        assert posts[1].kwargs["thread_ts"] is None
+        thread = sync_service.create_thread_mapping.await_args.kwargs
+        assert thread["slack_thread_ts"] == "100.2"
+    finally:
+        patch.stopall()
+
+
+async def test_one_review_is_fetched_once_for_all_its_comments():
+    with (
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service, "get_pull_request_review", new=AsyncMock(return_value={"body": "Low"})
+        ) as fetch,
+        patch.object(sync_service, "_post_attributed_to_github_user", new=AsyncMock()) as post,
+    ):
+        for cid in (1, 2, 3):
+            await sync_service.handle_review_comment(_comment_payload(_inline(cid)))
+    assert fetch.await_count == 1
+    post.assert_not_awaited()
+
+
+async def test_unreadable_review_posts_its_comment_on_its_own():
+    with (
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service,
+            "get_pull_request_review",
+            new=AsyncMock(side_effect=httpx.ConnectError("x")),
+        ),
+        patch.object(sync_service, "get_thread_mapping", new=AsyncMock(return_value=None)),
+        patch.object(sync_service, "github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
+        patch.object(
+            sync_service, "_post_attributed_to_github_user", new=AsyncMock(return_value=["9.1"])
+        ) as post,
+        patch.object(sync_service, "create_thread_mapping", new=AsyncMock()),
+        patch.object(sync_service, "create_message_mapping", new=AsyncMock()),
+    ):
+        await sync_service.handle_review_comment(_comment_payload(_inline(1)))
+    post.assert_awaited_once()
+
+
+async def test_programming_errors_in_the_review_lookup_are_not_swallowed():
+    with (
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service, "get_pull_request_review", new=AsyncMock(side_effect=KeyError("body"))
+        ),
+        pytest.raises(KeyError),
+    ):
+        await sync_service.handle_review_comment(_comment_payload(_inline(1)))
+
+
+async def test_early_reply_waits_for_its_threads_mapping():
+    mapping = SimpleNamespace(slack_thread_ts="100.1")
+    with (
+        patch.object(sync_service.settings, "collapse_review_comments", True),
+        patch.object(sync_service, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_C_PR)),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(
+            sync_service, "get_thread_mapping", new=AsyncMock(side_effect=[None, None, mapping])
+        ),
+        patch.object(sync_service, "github_body_to_slack", new=AsyncMock(side_effect=lambda b: b)),
+        patch.object(
+            sync_service, "_post_attributed_to_github_user", new=AsyncMock(return_value=["100.5"])
+        ) as post,
+        patch.object(sync_service, "create_thread_mapping", new=AsyncMock()) as thread_map,
+        patch.object(sync_service, "create_message_mapping", new=AsyncMock()),
+    ):
+        await sync_service.handle_review_comment(_comment_payload(_inline(2, reply_to=1)))
+    assert post.await_args.kwargs["thread_ts"] == "100.1"
+    thread_map.assert_not_awaited()
+
+
+async def test_top_level_message_with_no_single_open_pr_is_answered_not_dropped():
+    open_prs = [
+        SimpleNamespace(github_pr_number=6, organization_id=10),
+        SimpleNamespace(github_pr_number=7, organization_id=10),
+    ]
+    with (
+        patch.object(
+            sync_service,
+            "resolve_channel_pr",
+            new=AsyncMock(return_value=ChannelTarget(None, open_prs)),
+        ),
+        patch.object(sync_service, "get_org", new=AsyncMock(return_value=_C_ORG)),
+        patch.object(sync_service.slack_service, "post_message", new=AsyncMock()) as post,
+        patch.object(sync_service, "create_issue_comment", new=AsyncMock()) as comment,
+    ):
+        await sync_service.handle_slack_message("C1", "U1", "hi", None, "300.1", "T1")
+    comment.assert_not_awaited()
+    assert post.await_args.kwargs["thread_ts"] == "300.1"
+    assert "#6, #7" in post.await_args.args[1]

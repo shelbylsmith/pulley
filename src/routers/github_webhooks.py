@@ -15,6 +15,7 @@ async def _dispatch_event(event: str, action: str | None, payload: dict) -> None
     """Route a GitHub webhook event to the appropriate handler."""
     from src.services.channel_manager import (
         handle_pr_closed,
+        handle_pr_labeled,
         handle_pr_opened,
         handle_pr_reopened,
         handle_pr_updated,
@@ -42,6 +43,8 @@ async def _dispatch_event(event: str, action: str | None, payload: dict) -> None
             await handle_pr_opened(payload)
         elif action == "reopened":
             await handle_pr_reopened(payload)
+        elif action == "labeled":
+            await handle_pr_labeled(payload)
         elif action == "closed":
             await handle_pr_closed(payload)
         elif action in ("edited", "converted_to_draft", "ready_for_review", "synchronize"):

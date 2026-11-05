@@ -172,12 +172,104 @@ async def get_pr_by_github_id(github_pr_id: int) -> PullRequest | None:
         return result.scalar_one_or_none()
 
 
+async def get_pr_by_id(pr_id: int) -> PullRequest | None:
+    async with _session() as s:
+        return await s.get(PullRequest, pr_id)
+
+
 async def get_pr_by_channel(slack_channel_id: str) -> PullRequest | None:
+    """The PR that owns the channel. Stacked PRs that share it are excluded."""
     async with _session() as s:
         result = await s.execute(
-            select(PullRequest).where(PullRequest.slack_channel_id == slack_channel_id)
+            select(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.slack_thread_ts.is_(None))
         )
         return result.scalar_one_or_none()
+
+
+async def get_pr_by_channel_thread(
+    slack_channel_id: str, slack_thread_ts: str
+) -> PullRequest | None:
+    """The stacked PR whose parent message in this channel is `slack_thread_ts`."""
+    async with _session() as s:
+        result = await s.execute(
+            select(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.slack_thread_ts == slack_thread_ts)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_stack_parent(repo_full_name: str, base_branch: str) -> PullRequest | None:
+    """The open PR with a channel whose head branch is `base_branch`: the PR a
+    new PR on that base is stacked on.
+
+    The head branch must live in this repository. A fork PR's head branch is a
+    branch of the fork, so a fork PR from `main` is no parent of PRs on `main`.
+    Rows without a recorded head repository predate the column and never match.
+    """
+    async with _session() as s:
+        result = await s.execute(
+            select(PullRequest)
+            .where(PullRequest.repo_full_name == repo_full_name)
+            .where(PullRequest.head_repo_full_name == repo_full_name)
+            .where(PullRequest.head_branch == base_branch)
+            .where(PullRequest.state == "open")
+            .where(PullRequest.slack_channel_id.is_not(None))
+            .order_by(PullRequest.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+async def count_open_prs_in_channel(slack_channel_id: str) -> int:
+    async with _session() as s:
+        result = await s.execute(
+            select(func.count())
+            .select_from(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.state == "open")
+        )
+        return int(result.scalar_one())
+
+
+async def get_open_prs_in_channel(slack_channel_id: str) -> list[PullRequest]:
+    """The open PRs that post in this channel: its owner and any stacked PRs."""
+    async with _session() as s:
+        result = await s.execute(
+            select(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.state == "open")
+            .order_by(PullRequest.github_pr_number)
+        )
+        return list(result.scalars().all())
+
+
+async def get_pr_in_channel_by_number(slack_channel_id: str, pr_number: int) -> PullRequest | None:
+    async with _session() as s:
+        result = await s.execute(
+            select(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.github_pr_number == pr_number)
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+async def set_channel_archived(slack_channel_id: str, archived: bool) -> None:
+    """Record whether a PR channel is archived. A stack's channel stays open
+    while any PR in it is open, so this follows the channel, not one PR."""
+    async with _session() as s:
+        result = await s.execute(
+            select(SlackChannel).where(SlackChannel.slack_channel_id == slack_channel_id)
+        )
+        channel = result.scalar_one_or_none()
+        if not channel:
+            return
+        channel.is_archived = archived
+        channel.archived_at = datetime.now(UTC) if archived else None
+        await s.commit()
 
 
 async def get_open_prs_for_org(slack_team_id: str) -> list[PullRequest]:
@@ -444,7 +536,11 @@ async def create_pr_and_channel(
     slack_channel_id: str,
     slack_channel_name: str,
     title_bookmark_id: str | None = None,
+    slack_thread_ts: str | None = None,
+    head_repo_full_name: str | None = None,
 ) -> PullRequest:
+    """Create the PR row. A stacked PR (`slack_thread_ts` set) joins its stack's
+    channel, which already has its SlackChannel row, so none is created."""
     async with _session() as s:
         pr = PullRequest(
             organization_id=organization_id,
@@ -454,15 +550,22 @@ async def create_pr_and_channel(
             title=title,
             is_draft=is_draft,
             head_branch=head_branch,
+            head_repo_full_name=head_repo_full_name,
             base_branch=base_branch,
             html_url=html_url,
             author_github_id=author_github_id,
             author_github_username=author_github_username,
             slack_channel_id=slack_channel_id,
             title_bookmark_id=title_bookmark_id,
+            slack_thread_ts=slack_thread_ts,
         )
         s.add(pr)
         await s.flush()
+
+        if slack_thread_ts:
+            await s.commit()
+            await s.refresh(pr)
+            return pr
 
         channel = SlackChannel(
             pull_request_id=pr.id,
@@ -743,11 +846,11 @@ async def set_pr_draft_state(github_pr_id: int, is_draft: bool) -> PullRequest |
 
 
 async def close_pr(github_pr_id: int, *, merged: bool) -> PullRequest | None:
+    """Mark the PR closed. The caller archives the channel and records it with
+    `set_channel_archived`, because a stack's channel can outlive its owner."""
     async with _session() as s:
         result = await s.execute(
-            select(PullRequest)
-            .where(PullRequest.github_pr_id == github_pr_id)
-            .options(selectinload(PullRequest.slack_channel))
+            select(PullRequest).where(PullRequest.github_pr_id == github_pr_id)
         )
         pr = result.scalar_one_or_none()
         if not pr:
@@ -759,22 +862,17 @@ async def close_pr(github_pr_id: int, *, merged: bool) -> PullRequest | None:
             pr.merged_at = now
         pr.closed_at = now
 
-        if pr.slack_channel:
-            pr.slack_channel.is_archived = True
-            pr.slack_channel.archived_at = now
-
         await s.commit()
         await s.refresh(pr)
         return pr
 
 
 async def reopen_pr(github_pr_id: int) -> PullRequest | None:
-    """Flip a closed/merged PR back to open and unarchive its channel."""
+    """Flip a closed/merged PR back to open. The caller unarchives the channel
+    and records it with `set_channel_archived`."""
     async with _session() as s:
         result = await s.execute(
-            select(PullRequest)
-            .where(PullRequest.github_pr_id == github_pr_id)
-            .options(selectinload(PullRequest.slack_channel))
+            select(PullRequest).where(PullRequest.github_pr_id == github_pr_id)
         )
         pr = result.scalar_one_or_none()
         if not pr:
@@ -783,10 +881,6 @@ async def reopen_pr(github_pr_id: int) -> PullRequest | None:
         pr.state = "open"
         pr.closed_at = None
         pr.merged_at = None
-
-        if pr.slack_channel:
-            pr.slack_channel.is_archived = False
-            pr.slack_channel.archived_at = None
 
         await s.commit()
         await s.refresh(pr)
@@ -797,11 +891,15 @@ async def reopen_pr(github_pr_id: int) -> PullRequest | None:
 
 
 async def get_thread_mapping(pull_request_id: int, github_thread_id: str) -> ThreadMapping | None:
+    # Nothing makes (pull_request_id, github_thread_id) unique, so tolerate a
+    # duplicate from a race and use the oldest row.
     async with _session() as s:
         result = await s.execute(
             select(ThreadMapping)
             .where(ThreadMapping.pull_request_id == pull_request_id)
             .where(ThreadMapping.github_thread_id == github_thread_id)
+            .order_by(ThreadMapping.id)
+            .limit(1)
         )
         return result.scalar_one_or_none()
 
@@ -809,13 +907,21 @@ async def get_thread_mapping(pull_request_id: int, github_thread_id: str) -> Thr
 async def get_thread_mapping_by_slack_ts(
     pull_request_id: int, slack_thread_ts: str
 ) -> ThreadMapping | None:
+    """The one GitHub review thread mapped to this Slack thread, or None.
+
+    A collapsed review maps each of its comment threads to the review's Slack
+    thread. A Slack reply there cannot say which comment it answers, so with
+    more than one mapping this returns None and the reply becomes a PR comment.
+    """
     async with _session() as s:
         result = await s.execute(
             select(ThreadMapping)
             .where(ThreadMapping.pull_request_id == pull_request_id)
             .where(ThreadMapping.slack_thread_ts == slack_thread_ts)
+            .limit(2)
         )
-        return result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        return rows[0] if len(rows) == 1 else None
 
 
 async def create_thread_mapping(
@@ -826,6 +932,11 @@ async def create_thread_mapping(
     slack_thread_ts: str,
     file_path: str = "",
 ) -> ThreadMapping:
+    """Map a GitHub review thread to a Slack thread. Returns the existing
+    mapping when there is one, so a redelivered event adds no duplicate."""
+    existing = await get_thread_mapping(pull_request_id, github_thread_id)
+    if existing:
+        return existing
     async with _session() as s:
         mapping = ThreadMapping(
             pull_request_id=pull_request_id,
@@ -893,6 +1004,20 @@ async def get_message_mapping_by_slack_ts(
         return result.scalar_one_or_none()
 
 
+async def get_message_mapping_in_channel(
+    slack_channel_id: str, slack_ts: str
+) -> MessageMapping | None:
+    """The mapping for one Slack message, whichever PR in the channel owns it."""
+    async with _session() as s:
+        result = await s.execute(
+            select(MessageMapping)
+            .where(MessageMapping.slack_channel_id == slack_channel_id)
+            .where(MessageMapping.slack_ts == slack_ts)
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
 async def get_message_mapping_by_github_comment(
     github_comment_id: int, github_comment_type: str
 ) -> MessageMapping | None:
@@ -901,6 +1026,8 @@ async def get_message_mapping_by_github_comment(
             select(MessageMapping)
             .where(MessageMapping.github_comment_id == github_comment_id)
             .where(MessageMapping.github_comment_type == github_comment_type)
+            .order_by(MessageMapping.id)
+            .limit(1)
         )
         return result.scalar_one_or_none()
 

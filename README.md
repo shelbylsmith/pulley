@@ -16,7 +16,7 @@ in place as the PR moves through its lifecycle.
 - **Attributed posts** — Slack → GitHub posts use the user's OAuth token (appears as them on GitHub). GitHub → Slack posts use `chat:write.customize` to render with the user's Slack display name and avatar. Users who haven't linked fall back to bot-attributed posts.
 - **Org-wide PR digest** — one Slack message per PR in a configurable channel, with a colored sidebar + status emoji. Updated in place on draft ↔ ready, approved, changes requested, merged, closed. Drafts are suppressed until marked ready.
 - **Issue cards** — one Slack message per GitHub issue in a configurable channel, with a colored sidebar + status emoji. Updated in place as the issue is edited, labelled, assigned, closed and reopened; removed if the issue is deleted.
-- **Slash commands** — `/pulley open`, `/pulley me`, `/pulley team <name>`, `/pulley merge [squash|rebase|merge]`, `/pulley settings [pr|ci|issues|recap #channel]` (see [Configure channels](#5-configure-channels)); `/lgtm [comment]` to approve from Slack.
+- **Slash commands** — `/pulley open`, `/pulley me`, `/pulley team <name>`, `/pulley merge [#N] [squash|rebase|merge]`, `/pulley settings [pr|ci|issues|recap #channel]` (see [Configure channels](#5-configure-channels)); `/lgtm [#N] [comment]` to approve from Slack. In a stack's channel, `#N` names the PR when more than one is open.
 - **CI / deployment notifications** — workflow run failures and deployment statuses post to the configured CI channel.
 - **Daily recap + stale reminders** — weekday PR summaries and stale-PR nudges, driven by the built-in scheduler or by an external cron hitting the internal endpoints (see [Configuration](#configuration)).
 - **Repo allowlist / excludes** — `GITHUB_ALLOWED_REPOS` env var (comma-separated `owner/repo`) scopes the bot to a subset of installed repos for soft-launches; empty = all. `GITHUB_EXCLUDED_REPOS` (same format) drops events from specific repos even if they'd otherwise be allowed — exclusion wins over the allowlist.
@@ -63,6 +63,10 @@ environment).
 | `LOG_LEVEL` | `INFO` | Python log level. |
 | `GITHUB_ALLOWED_REPOS` | _(empty)_ | Comma-separated `owner/repo` allowlist. Empty = act on every installed repo. |
 | `GITHUB_EXCLUDED_REPOS` | _(empty)_ | Comma-separated `owner/repo` exclude list. Exclusion wins over the allowlist. |
+| `SLACK_CHANNEL_LABEL` | _(empty)_ | When set, a PR gets a channel only once it carries this label (on the `labeled` event, which GitHub also sends for labels set at creation). Empty = every PR gets a channel when it opens. |
+| `COLLAPSE_REVIEW_COMMENTS` | `false` | Post a review's inline comments as replies under its summary message instead of one top-level message each. A lone inline comment (a review with no summary) is unchanged. |
+| `STACK_CHANNELS` | `false` | A PR whose base is another tracked open PR's head branch shares that PR's channel. It gets one parent message there, and all its activity goes in that thread. The channel is archived when the last open PR in it closes. |
+| `STACK_PARENT_EXCLUDED_BRANCHES` | `main,master,develop,dev,staging,production,release/*` | Head branches that never count as a stack parent (fnmatch patterns, comma-separated), so a long-lived PR such as `develop` → `main` does not collect every PR that targets `develop`. The repository's default branch is always excluded. A fork PR is never a stack parent. |
 | `SCHEDULER_ENABLED` | `false` | Run the in-app scheduler for recap + stale reminders. Needs exactly one always-on instance. |
 | `RECAP_CRON` | `0 9 * * 1-5` | Fallback recap schedule (5-field cron, UTC). Per-org override lives in `organizations.recap_cron`. |
 | `STALE_REMINDER_CRON` | `0 14 * * 1-5` | Stale-reminder schedule for every org (5-field cron, UTC). |
