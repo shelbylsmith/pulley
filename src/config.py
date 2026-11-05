@@ -41,6 +41,19 @@ class Settings(BaseSettings):
     # Authorization: Bearer <token>.
     internal_api_token: str = ""
 
+    # When set, a PR gets a Slack channel only once it carries this label: on
+    # the `labeled` event, which GitHub also sends for labels set at creation.
+    # Empty = every PR gets a channel when it opens.
+    slack_channel_label: str = ""
+    # Post a review's inline comments as replies in the thread of the review's
+    # summary message, instead of one top-level message per comment. Applies to
+    # reviews that have a summary body; a lone inline comment is unchanged.
+    collapse_review_comments: bool = False
+    # A PR whose base branch is the head branch of another tracked open PR (a
+    # stacked PR) shares that PR's channel instead of getting its own. It gets
+    # one parent message there, and all its activity goes into that thread.
+    stack_channels: bool = False
+
     @property
     def base_url(self) -> str:
         return self.app_base_url

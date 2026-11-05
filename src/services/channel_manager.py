@@ -5,6 +5,7 @@ import re
 
 import slack_sdk.errors
 
+from src.config import settings
 from src.db.queries import (
     close_pr,
     create_pr_and_channel,
@@ -71,12 +72,43 @@ def _should_skip_channel(payload: dict) -> bool:
     return "_noslackchannel" in labels
 
 
+def _has_channel_label(payload: dict) -> bool:
+    """True when no channel label is configured, or the PR carries it."""
+    wanted = settings.slack_channel_label.strip().lower()
+    if not wanted:
+        return True
+    labels = [label["name"].lower() for label in payload["pull_request"].get("labels", [])]
+    return wanted in labels
+
+
 # ── Event handlers ────────────────────────────────────────
 
 
 async def handle_pr_opened(payload: dict) -> None:
+    if settings.slack_channel_label:
+        # The channel opens on the `labeled` event instead. GitHub sends one
+        # for a label set at creation too, so acting here as well would race it.
+        logger.info("Channel label configured; waiting for it before opening a channel")
+        return
+    await _open_channel(payload)
+
+
+async def handle_pr_labeled(payload: dict) -> None:
+    """Open the PR's channel when the configured channel label is added."""
+    wanted = settings.slack_channel_label.strip().lower()
+    if not wanted or payload.get("label", {}).get("name", "").lower() != wanted:
+        return
+    if payload["pull_request"].get("state") != "open":
+        return
+    await _open_channel(payload)
+
+
+async def _open_channel(payload: dict) -> None:
     if _should_skip_channel(payload):
         logger.info("Skipping channel creation (opt-out marker found)")
+        return
+    if not _has_channel_label(payload):
+        logger.info("Skipping channel creation (channel label missing)")
         return
 
     pr = payload["pull_request"]
@@ -216,7 +248,9 @@ async def handle_pr_reopened(payload: dict) -> None:
     existing = await get_pr_by_github_id(pr["id"])
     if not existing:
         logger.info("PR %s#%d reopened but not tracked — running open flow", repo, pr_number)
-        await handle_pr_opened(payload)
+        # `_open_channel` (not handle_pr_opened) so a reopened PR that already
+        # carries the channel label gets its channel without a fresh `labeled`.
+        await _open_channel(payload)
         return
 
     db_pr = await reopen_pr(pr["id"])

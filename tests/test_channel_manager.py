@@ -250,3 +250,81 @@ async def test_opened_resumes_on_name_taken():
         )
     finally:
         patch.stopall()
+
+
+# ── Channel label gate ────────────────────────────────────
+
+
+async def test_opened_waits_for_label_when_gate_configured():
+    """With a channel label configured, `opened` never opens a channel itself."""
+    with (
+        patch.object(channel_manager.settings, "slack_channel_label", "human-review"),
+        patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel,
+    ):
+        await channel_manager.handle_pr_opened(_opened_payload())
+    open_channel.assert_not_awaited()
+
+
+async def test_opened_opens_channel_without_gate():
+    with patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel:
+        await channel_manager.handle_pr_opened(_opened_payload())
+    open_channel.assert_awaited_once()
+
+
+def _labeled_payload(label: str, *, on_pr: bool = True, state: str = "open") -> dict:
+    payload = _opened_payload()
+    payload["label"] = {"name": label}
+    payload["pull_request"]["state"] = state
+    if on_pr:
+        payload["pull_request"]["labels"] = [{"name": label}]
+    return payload
+
+
+async def test_labeled_with_channel_label_opens_channel():
+    with (
+        patch.object(channel_manager.settings, "slack_channel_label", "human-review"),
+        patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel,
+    ):
+        await channel_manager.handle_pr_labeled(_labeled_payload("Human-Review"))
+    open_channel.assert_awaited_once()
+
+
+async def test_labeled_with_other_label_is_ignored():
+    with (
+        patch.object(channel_manager.settings, "slack_channel_label", "human-review"),
+        patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel,
+    ):
+        await channel_manager.handle_pr_labeled(_labeled_payload("claude-review"))
+    open_channel.assert_not_awaited()
+
+
+async def test_labeled_on_closed_pr_is_ignored():
+    with (
+        patch.object(channel_manager.settings, "slack_channel_label", "human-review"),
+        patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel,
+    ):
+        await channel_manager.handle_pr_labeled(_labeled_payload("human-review", state="closed"))
+    open_channel.assert_not_awaited()
+
+
+async def test_labeled_without_gate_is_ignored():
+    """Without a configured label, `opened` already opened the channel."""
+    with patch.object(channel_manager, "_open_channel", new=AsyncMock()) as open_channel:
+        await channel_manager.handle_pr_labeled(_labeled_payload("human-review"))
+    open_channel.assert_not_awaited()
+
+
+async def test_reopened_untracked_pr_without_label_gets_no_channel():
+    patches = _open_patches()
+    patches.append(
+        patch.object(channel_manager, "get_pr_by_github_id", new=AsyncMock(return_value=None))
+    )
+    patches.append(patch.object(channel_manager.slack_service, "create_channel", new=AsyncMock()))
+    patches.append(patch.object(channel_manager.settings, "slack_channel_label", "human-review"))
+    for p in patches:
+        p.start()
+    try:
+        await channel_manager.handle_pr_reopened(_opened_payload())
+        channel_manager.slack_service.create_channel.assert_not_awaited()
+    finally:
+        patch.stopall()
