@@ -63,6 +63,9 @@ environment).
 | `LOG_LEVEL` | `INFO` | Python log level. |
 | `GITHUB_ALLOWED_REPOS` | _(empty)_ | Comma-separated `owner/repo` allowlist. Empty = act on every installed repo. |
 | `GITHUB_EXCLUDED_REPOS` | _(empty)_ | Comma-separated `owner/repo` exclude list. Exclusion wins over the allowlist. |
+| `SLACK_CHANNEL_LABEL` | _(empty)_ | When set, a PR gets a channel only once it carries this label (on the `labeled` event, which GitHub also sends for labels set at creation). Empty = every PR gets a channel when it opens. |
+| `COLLAPSE_REVIEW_COMMENTS` | `false` | Post a review's inline comments as replies under its summary message instead of one top-level message each. A lone inline comment (a review with no summary) is unchanged. |
+| `STACK_CHANNELS` | `false` | A PR whose base is another tracked open PR's head branch shares that PR's channel. It gets one parent message there, and all its activity goes in that thread. The channel is archived when the last open PR in it closes. |
 | `SCHEDULER_ENABLED` | `false` | Run the in-app scheduler for recap + stale reminders. Needs exactly one always-on instance. |
 | `RECAP_CRON` | `0 9 * * 1-5` | Fallback recap schedule (5-field cron, UTC). Per-org override lives in `organizations.recap_cron`. |
 | `STALE_REMINDER_CRON` | `0 14 * * 1-5` | Stale-reminder schedule for every org (5-field cron, UTC). |

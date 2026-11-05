@@ -127,28 +127,8 @@ def _aggregate_check_state(check_runs: list[dict]) -> tuple[str, str, str]:
 # ── CI/CD Check Suites ───────────────────────────────────
 
 
-async def _refresh_ci_bookmark(
-    db_pr,
-    installation_id: int,
-    head_sha: str,
-    bot_token: str | None,
-) -> None:
-    """Re-roll the PR channel's CI bookmark from current GitHub check-runs."""
-    if not db_pr.slack_channel_id:
-        return
-
-    try:
-        check_runs = await github_service.get_check_runs_for_ref(
-            installation_id, db_pr.repo_full_name, head_sha
-        )
-    except Exception:
-        logger.exception("Failed to fetch check-runs for %s@%s", db_pr.repo_full_name, head_sha)
-        return
-
-    emoji, title, _ = _aggregate_check_state(check_runs)
-    bookmark_title = f"{emoji} {title}"
-    checks_url = f"{db_pr.html_url}/checks"
-
+async def _set_ci_bookmark(db_pr, bookmark_title: str, checks_url: str, bot_token) -> None:
+    """Edit the channel's CI bookmark in place, or add it when missing."""
     bookmark_updated_in_place = False
     try:
         if db_pr.ci_bookmark_id:
@@ -179,6 +159,34 @@ async def _refresh_ci_bookmark(
             return
         await set_pr_ci_bookmark_id(db_pr.id, bookmark["id"])
 
+
+async def _refresh_ci_bookmark(
+    db_pr,
+    installation_id: int,
+    head_sha: str,
+    bot_token: str | None,
+) -> None:
+    """Re-roll the PR channel's CI bookmark from current GitHub check-runs."""
+    if not db_pr.slack_channel_id:
+        return
+
+    try:
+        check_runs = await github_service.get_check_runs_for_ref(
+            installation_id, db_pr.repo_full_name, head_sha
+        )
+    except Exception:
+        logger.exception("Failed to fetch check-runs for %s@%s", db_pr.repo_full_name, head_sha)
+        return
+
+    emoji, title, _ = _aggregate_check_state(check_runs)
+    bookmark_title = f"{emoji} {title}"
+    checks_url = f"{db_pr.html_url}/checks"
+
+    # A stacked PR shares its stack's channel, whose bookmarks belong to the
+    # PR that owns it. The stacked PR only gets the recap in its thread.
+    if not db_pr.slack_thread_ts:
+        await _set_ci_bookmark(db_pr, bookmark_title, checks_url, bot_token)
+
     # Post a recap only on completion + state transition. Bookmarks are silent,
     # so without this a passing→failing flip would go unnoticed. The DB-side
     # conditional update dedupes when check_suite/workflow_run events race.
@@ -189,6 +197,7 @@ async def _refresh_ci_bookmark(
             await slack_service.post_message(
                 db_pr.slack_channel_id,
                 text=recap_title,
+                thread_ts=db_pr.slack_thread_ts,
                 attachments=_render_recap_attachment(
                     check_runs, new_state, recap_title, checks_url
                 ),
@@ -585,6 +594,7 @@ async def send_stale_pr_reminders(
             await slack_service.post_message(
                 db_pr.slack_channel_id,
                 f"⏰ Review requested {hours}h ago — still waiting on {', '.join(labels)}.",
+                thread_ts=db_pr.slack_thread_ts,
                 token=bot_token,
             )
             logger.info(

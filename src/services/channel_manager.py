@@ -8,6 +8,7 @@ import slack_sdk.errors
 from src.config import settings
 from src.db.queries import (
     close_pr,
+    count_open_prs_in_channel,
     create_pr_and_channel,
     get_org,
     get_org_by_installation,
@@ -15,6 +16,7 @@ from src.db.queries import (
     get_pr_by_github_id,
     get_pr_by_repo_and_number,
     get_slack_ids_for_github_usernames,
+    get_stack_parent,
     get_user_by_slack_id,
     get_user_with_timeslots,
     reopen_pr,
@@ -81,6 +83,14 @@ def _has_channel_label(payload: dict) -> bool:
     return wanted in labels
 
 
+async def _post(db_pr, text: str, token: str | None) -> dict:
+    """Post about a PR: top-level in its own channel, or in its thread when it
+    is a stacked PR sharing its stack's channel."""
+    return await slack_service.post_message(
+        db_pr.slack_channel_id, text, thread_ts=db_pr.slack_thread_ts, token=token
+    )
+
+
 # ── Event handlers ────────────────────────────────────────
 
 
@@ -131,6 +141,12 @@ async def _open_channel(payload: dict) -> None:
             org.github_org_login,
         )
         return
+
+    if settings.stack_channels:
+        parent = await get_stack_parent(repo, pr["base"]["ref"])
+        if parent:
+            await _join_stack(payload, org, parent)
+            return
 
     channel_name = _make_channel_name(repo, pr_number)
     logger.info("Creating channel %s for %s#%d", channel_name, repo, pr_number)
@@ -211,6 +227,66 @@ async def _open_channel(payload: dict) -> None:
     )
 
 
+async def _join_stack(payload: dict, org, parent) -> None:
+    """Track a stacked PR in its stack's channel: one top-level parent message,
+    and everything else about the PR in that message's thread."""
+    pr = payload["pull_request"]
+    repo = payload["repository"]["full_name"]
+    channel_id = parent.slack_channel_id
+    token = org.slack_bot_token
+    author = pr["user"]["login"]
+    state_emoji = "📝" if pr.get("draft") else "🟢"
+
+    try:
+        await slack_service.unarchive_channel(channel_id, token=token)
+    except Exception as e:  # noqa: BLE001 — Slack raises `not_archived` if already active
+        logger.debug("Unarchive skipped for %s: %s", channel_id, e)
+
+    parent_msg = await slack_service.post_message(
+        channel_id,
+        f"{state_emoji} *<{pr['html_url']}|{repo}#{pr['number']}>* opened by *{author}*, "
+        f"stacked on #{parent.github_pr_number}\n"
+        f"> {pr['title']}\n"
+        f"Base: `{pr['base']['ref']}` ← Head: `{pr['head']['ref']}`\n"
+        "_Updates on this PR go in this thread._",
+        token=token,
+    )
+
+    reviewers = [r["login"] for r in pr.get("requested_reviewers", [])]
+    slack_ids = await get_slack_ids_for_github_usernames([author] + reviewers)
+    if slack_ids:
+        await slack_service.invite_to_channel(channel_id, slack_ids, token=token)
+
+    db_pr = await create_pr_and_channel(
+        organization_id=org.id,
+        github_pr_id=pr["id"],
+        github_pr_number=pr["number"],
+        repo_full_name=repo,
+        title=pr["title"],
+        is_draft=pr.get("draft", False),
+        head_branch=pr["head"]["ref"],
+        base_branch=pr["base"]["ref"],
+        html_url=pr["html_url"],
+        author_github_id=pr["user"]["id"],
+        author_github_username=author,
+        slack_channel_id=channel_id,
+        slack_channel_name="",
+        slack_thread_ts=parent_msg["ts"],
+    )
+    if reviewers:
+        db_pr = await set_pr_reviewers(pr["id"], reviewers)
+
+    await pr_digest_service.post_initial(db_pr, org)
+
+    logger.info(
+        "%s#%d stacked on #%d; joined channel %s",
+        repo,
+        pr["number"],
+        parent.github_pr_number,
+        channel_id,
+    )
+
+
 async def handle_pr_closed(payload: dict) -> None:
     pr = payload["pull_request"]
     repo = payload["repository"]["full_name"]
@@ -228,13 +304,23 @@ async def handle_pr_closed(payload: dict) -> None:
 
     action = "merged" if merged else "closed"
     emoji = "✅" if merged else "❌"
-    await slack_service.post_message(channel_id, f"PR {action} {emoji}", token=token)
-    await slack_service.archive_channel(channel_id, token=token)
+    await _post(db_pr, f"PR {action} {emoji}", token)
+    # A stack's channel stays open while any PR in it is still open.
+    remaining = await count_open_prs_in_channel(channel_id)
+    if not remaining:
+        await slack_service.archive_channel(channel_id, token=token)
 
     if org:
         await pr_digest_service.update(pr["id"], org)
 
-    logger.info("PR %s#%d %s — archived channel %s", repo, pr_number, action, channel_id)
+    logger.info(
+        "PR %s#%d %s — channel %s %s",
+        repo,
+        pr_number,
+        action,
+        channel_id,
+        f"kept for {remaining} open PR(s)" if remaining else "archived",
+    )
 
 
 async def handle_pr_reopened(payload: dict) -> None:
@@ -267,7 +353,7 @@ async def handle_pr_reopened(payload: dict) -> None:
     except Exception as e:  # noqa: BLE001 — Slack raises `not_archived` if already active
         logger.debug("Unarchive skipped for %s: %s", channel_id, e)
 
-    await slack_service.post_message(channel_id, "🔄 PR reopened", token=token)
+    await _post(db_pr, "🔄 PR reopened", token)
 
     if org:
         await pr_digest_service.update(pr["id"], org)
@@ -305,7 +391,7 @@ async def handle_pr_updated(payload: dict, action: str) -> None:
     }
 
     msg = messages.get(action, f"PR updated: {action}")
-    await slack_service.post_message(db_pr.slack_channel_id, msg, token=token)
+    await _post(db_pr, msg, token)
 
     # Track draft state changes on the DB row so the digest renders correctly
     if action == "converted_to_draft":
@@ -328,6 +414,13 @@ async def _handle_pr_renamed(db_pr, pr: dict, org, token: str | None) -> None:
     channel_id = db_pr.slack_channel_id
 
     await set_pr_title(pr["id"], new_title)
+
+    if db_pr.slack_thread_ts:
+        # A stacked PR does not own the channel's topic or bookmarks.
+        await _post(db_pr, f"✏️ PR title updated: *{new_title}*", token)
+        if org:
+            await pr_digest_service.update(pr["id"], org)
+        return
 
     await slack_service.set_channel_topic(
         channel_id,
@@ -374,11 +467,7 @@ async def _handle_pr_base_changed(
 
     await set_pr_base_branch(pr["id"], new_base)
 
-    await slack_service.post_message(
-        db_pr.slack_channel_id,
-        f"🎯 Merge target changed: `{old_base}` → `{new_base}`",
-        token=token,
-    )
+    await _post(db_pr, f"🎯 Merge target changed: `{old_base}` → `{new_base}`", token)
 
     if org:
         await pr_digest_service.update(pr["id"], org)
@@ -435,17 +524,13 @@ async def handle_reviewer_requested(payload: dict) -> None:
         tz = slots[0].get("timezone", "UTC") if slots else "UTC"
 
         if is_user_available(slots, tz):
-            await slack_service.post_message(
-                db_pr.slack_channel_id,
-                f"🔍 *{github_username}* was requested for review",
-                token=token,
-            )
+            await _post(db_pr, f"🔍 *{github_username}* was requested for review", token)
         else:
-            await slack_service.post_message(
-                db_pr.slack_channel_id,
+            await _post(
+                db_pr,
                 f"🔍 *{github_username}* was requested for review "
                 f"(outside review hours — they'll be notified later)",
-                token=token,
+                token,
             )
             logger.info(
                 "Reviewer %s is outside review hours, notification deferred",

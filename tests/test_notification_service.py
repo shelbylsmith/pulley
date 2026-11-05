@@ -277,6 +277,7 @@ async def test_stale_reminder_posts_for_aged_pending_request():
     db_pr = SimpleNamespace(
         id=7,
         slack_channel_id="C9",
+        slack_thread_ts=None,
         review_requested_at=datetime.now(UTC) - timedelta(hours=30),
     )
     with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
@@ -296,6 +297,7 @@ async def test_stale_reminder_mentions_linked_reviewer():
     db_pr = SimpleNamespace(
         id=7,
         slack_channel_id="C9",
+        slack_thread_ts=None,
         review_requested_at=datetime.now(UTC) - timedelta(hours=48),
     )
     with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
@@ -313,6 +315,7 @@ async def test_stale_reminder_silent_when_nobody_pending():
     db_pr = SimpleNamespace(
         id=7,
         slack_channel_id="C9",
+        slack_thread_ts=None,
         review_requested_at=datetime.now(UTC) - timedelta(hours=300),
     )
     with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
@@ -329,6 +332,7 @@ async def test_stale_reminder_waits_out_fresh_request():
     db_pr = SimpleNamespace(
         id=7,
         slack_channel_id="C9",
+        slack_thread_ts=None,
         review_requested_at=datetime.now(UTC) - timedelta(hours=2),
     )
     with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
@@ -343,7 +347,9 @@ async def test_stale_reminder_waits_out_fresh_request():
 
 async def test_stale_reminder_backfills_missing_clock():
     """Rows that predate the column get stamped now instead of reminded."""
-    db_pr = SimpleNamespace(id=7, slack_channel_id="C9", review_requested_at=None)
+    db_pr = SimpleNamespace(
+        id=7, slack_channel_id="C9", slack_thread_ts=None, review_requested_at=None
+    )
     with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:
         for p in _reminder_patches([_open_pr()], db_pr):
             p.start()
@@ -360,6 +366,7 @@ async def test_stale_reminder_skips_drafts():
     db_pr = SimpleNamespace(
         id=7,
         slack_channel_id="C9",
+        slack_thread_ts=None,
         review_requested_at=datetime.now(UTC) - timedelta(hours=100),
     )
     with patch.object(notification_service.slack_service, "post_message", new=AsyncMock()) as post:

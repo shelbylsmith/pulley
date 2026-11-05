@@ -172,12 +172,60 @@ async def get_pr_by_github_id(github_pr_id: int) -> PullRequest | None:
         return result.scalar_one_or_none()
 
 
+async def get_pr_by_id(pr_id: int) -> PullRequest | None:
+    async with _session() as s:
+        return await s.get(PullRequest, pr_id)
+
+
 async def get_pr_by_channel(slack_channel_id: str) -> PullRequest | None:
+    """The PR that owns the channel. Stacked PRs that share it are excluded."""
     async with _session() as s:
         result = await s.execute(
-            select(PullRequest).where(PullRequest.slack_channel_id == slack_channel_id)
+            select(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.slack_thread_ts.is_(None))
         )
         return result.scalar_one_or_none()
+
+
+async def get_pr_by_channel_thread(
+    slack_channel_id: str, slack_thread_ts: str
+) -> PullRequest | None:
+    """The stacked PR whose parent message in this channel is `slack_thread_ts`."""
+    async with _session() as s:
+        result = await s.execute(
+            select(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.slack_thread_ts == slack_thread_ts)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_stack_parent(repo_full_name: str, base_branch: str) -> PullRequest | None:
+    """The open PR with a channel whose head branch is `base_branch`: the PR a
+    new PR on that base is stacked on."""
+    async with _session() as s:
+        result = await s.execute(
+            select(PullRequest)
+            .where(PullRequest.repo_full_name == repo_full_name)
+            .where(PullRequest.head_branch == base_branch)
+            .where(PullRequest.state == "open")
+            .where(PullRequest.slack_channel_id.is_not(None))
+            .order_by(PullRequest.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+async def count_open_prs_in_channel(slack_channel_id: str) -> int:
+    async with _session() as s:
+        result = await s.execute(
+            select(func.count())
+            .select_from(PullRequest)
+            .where(PullRequest.slack_channel_id == slack_channel_id)
+            .where(PullRequest.state == "open")
+        )
+        return int(result.scalar_one())
 
 
 async def get_open_prs_for_org(slack_team_id: str) -> list[PullRequest]:
@@ -444,7 +492,10 @@ async def create_pr_and_channel(
     slack_channel_id: str,
     slack_channel_name: str,
     title_bookmark_id: str | None = None,
+    slack_thread_ts: str | None = None,
 ) -> PullRequest:
+    """Create the PR row. A stacked PR (`slack_thread_ts` set) joins its stack's
+    channel, which already has its SlackChannel row, so none is created."""
     async with _session() as s:
         pr = PullRequest(
             organization_id=organization_id,
@@ -460,9 +511,15 @@ async def create_pr_and_channel(
             author_github_username=author_github_username,
             slack_channel_id=slack_channel_id,
             title_bookmark_id=title_bookmark_id,
+            slack_thread_ts=slack_thread_ts,
         )
         s.add(pr)
         await s.flush()
+
+        if slack_thread_ts:
+            await s.commit()
+            await s.refresh(pr)
+            return pr
 
         channel = SlackChannel(
             pull_request_id=pr.id,
@@ -897,6 +954,20 @@ async def get_message_mapping_by_slack_ts(
             select(MessageMapping)
             .where(MessageMapping.pull_request_id == pull_request_id)
             .where(MessageMapping.slack_ts == slack_ts)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_message_mapping_in_channel(
+    slack_channel_id: str, slack_ts: str
+) -> MessageMapping | None:
+    """The mapping for one Slack message, whichever PR in the channel owns it."""
+    async with _session() as s:
+        result = await s.execute(
+            select(MessageMapping)
+            .where(MessageMapping.slack_channel_id == slack_channel_id)
+            .where(MessageMapping.slack_ts == slack_ts)
+            .limit(1)
         )
         return result.scalar_one_or_none()
 

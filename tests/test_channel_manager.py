@@ -57,6 +57,7 @@ _ORG = SimpleNamespace(slack_bot_token="xoxb")
 _DB_PR = SimpleNamespace(
     organization_id=1,
     slack_channel_id="C123",
+    slack_thread_ts=None,
     title_bookmark_id="Bk456",
     github_pr_number=42,
     repo_full_name="org/repo",
@@ -326,5 +327,163 @@ async def test_reopened_untracked_pr_without_label_gets_no_channel():
     try:
         await channel_manager.handle_pr_reopened(_opened_payload())
         channel_manager.slack_service.create_channel.assert_not_awaited()
+    finally:
+        patch.stopall()
+
+
+# ── Stack channels ────────────────────────────────────────
+
+_PARENT = SimpleNamespace(slack_channel_id="C_STACK", github_pr_number=41)
+
+
+def _stack_patches(parent) -> list:
+    patches = _open_patches()
+    patches += [
+        patch.object(channel_manager.settings, "stack_channels", True),
+        patch.object(channel_manager, "get_pr_by_github_id", new=AsyncMock(return_value=None)),
+        patch.object(channel_manager, "get_stack_parent", new=AsyncMock(return_value=parent)),
+        patch.object(
+            channel_manager.slack_service,
+            "create_channel",
+            new=AsyncMock(return_value={"id": "C_NEW"}),
+        ),
+        patch.object(channel_manager.slack_service, "unarchive_channel", new=AsyncMock()),
+    ]
+    # The parent message's ts becomes the stacked PR's thread.
+    patches.append(
+        patch.object(
+            channel_manager.slack_service,
+            "post_message",
+            new=AsyncMock(return_value={"ts": "200.1"}),
+        )
+    )
+    return patches
+
+
+async def test_stacked_pr_joins_its_parents_channel():
+    payload = _opened_payload()
+    payload["pull_request"]["base"] = {"ref": "feat/parent"}
+    for p in _stack_patches(_PARENT):
+        p.start()
+    try:
+        await channel_manager.handle_pr_opened(payload)
+
+        channel_manager.get_stack_parent.assert_awaited_once_with("org/repo", "feat/parent")
+        channel_manager.slack_service.create_channel.assert_not_awaited()
+        channel_manager.slack_service.set_channel_topic.assert_not_awaited()
+        channel_manager.slack_service.add_bookmark.assert_not_awaited()
+        post = channel_manager.slack_service.post_message.await_args
+        assert post.args[0] == "C_STACK"
+        assert post.kwargs.get("thread_ts") is None  # the parent message is top-level
+        assert "stacked on #41" in post.args[1]
+        created = channel_manager.create_pr_and_channel.await_args.kwargs
+        assert created["slack_channel_id"] == "C_STACK"
+        assert created["slack_thread_ts"] == "200.1"
+        channel_manager.pr_digest_service.post_initial.assert_awaited_once()
+    finally:
+        patch.stopall()
+
+
+async def test_pr_without_a_tracked_parent_gets_its_own_channel():
+    for p in _stack_patches(None):
+        p.start()
+    try:
+        await channel_manager.handle_pr_opened(_opened_payload())
+        channel_manager.slack_service.create_channel.assert_awaited_once()
+        assert "slack_thread_ts" not in channel_manager.create_pr_and_channel.await_args.kwargs
+    finally:
+        patch.stopall()
+
+
+async def test_stack_lookup_is_off_by_default():
+    patches = _stack_patches(_PARENT)
+    patches[len(_open_patches())] = patch.object(channel_manager.settings, "stack_channels", False)
+    for p in patches:
+        p.start()
+    try:
+        await channel_manager.handle_pr_opened(_opened_payload())
+        channel_manager.get_stack_parent.assert_not_awaited()
+        channel_manager.slack_service.create_channel.assert_awaited_once()
+    finally:
+        patch.stopall()
+
+
+_STACKED = SimpleNamespace(
+    organization_id=1,
+    slack_channel_id="C_STACK",
+    slack_thread_ts="200.1",
+    title_bookmark_id=None,
+    github_pr_number=42,
+    repo_full_name="org/repo",
+    html_url="https://gh/pr/42",
+)
+
+
+def _closed_payload(merged: bool = True) -> dict:
+    return {
+        "pull_request": {"id": 999, "number": 42, "merged": merged},
+        "repository": {"full_name": "org/repo"},
+    }
+
+
+async def _close(db_pr, remaining: int):
+    with (
+        patch.object(channel_manager, "close_pr", new=AsyncMock(return_value=db_pr)),
+        patch.object(channel_manager, "get_org", new=AsyncMock(return_value=_ORG)),
+        patch.object(
+            channel_manager, "count_open_prs_in_channel", new=AsyncMock(return_value=remaining)
+        ),
+        patch.object(channel_manager.pr_digest_service, "update", new=AsyncMock()),
+        patch.object(channel_manager.slack_service, "post_message", new=AsyncMock()) as post,
+        patch.object(channel_manager.slack_service, "archive_channel", new=AsyncMock()) as archive,
+    ):
+        await channel_manager.handle_pr_closed(_closed_payload())
+    return post, archive
+
+
+async def test_closing_a_pr_keeps_the_channel_while_its_stack_is_open():
+    post, archive = await _close(_STACKED, remaining=2)
+    archive.assert_not_awaited()
+    assert post.await_args.kwargs["thread_ts"] == "200.1"
+
+
+async def test_closing_the_last_open_pr_archives_the_channel():
+    post, archive = await _close(_DB_PR, remaining=0)
+    archive.assert_awaited_once_with("C123", token="xoxb")
+    assert post.await_args.kwargs["thread_ts"] is None
+
+
+async def test_stacked_pr_push_notice_goes_in_its_thread():
+    payload = {
+        "pull_request": {"id": 999, "number": 42, "head": {"ref": "feat/x"}},
+        "repository": {"full_name": "org/repo"},
+    }
+    with (
+        patch.object(
+            channel_manager, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_STACKED)
+        ),
+        patch.object(channel_manager, "get_org", new=AsyncMock(return_value=_ORG)),
+        patch.object(channel_manager.slack_service, "post_message", new=AsyncMock()) as post,
+    ):
+        await channel_manager.handle_pr_updated(payload, "synchronize")
+    assert post.await_args.args[0] == "C_STACK"
+    assert post.await_args.kwargs["thread_ts"] == "200.1"
+
+
+async def test_renaming_a_stacked_pr_leaves_the_channel_topic_alone():
+    patches = _rename_patches()
+    patches[0] = patch.object(
+        channel_manager, "get_pr_by_repo_and_number", new=AsyncMock(return_value=_STACKED)
+    )
+    for p in patches:
+        p.start()
+    try:
+        await channel_manager.handle_pr_updated(
+            _edited_payload({"title": {"from": "Old title"}}), "edited"
+        )
+        channel_manager.set_pr_title.assert_awaited_once_with(999, "New title")
+        channel_manager.slack_service.set_channel_topic.assert_not_awaited()
+        channel_manager.slack_service.edit_bookmark.assert_not_awaited()
+        assert channel_manager.slack_service.post_message.await_args.kwargs["thread_ts"] == "200.1"
     finally:
         patch.stopall()

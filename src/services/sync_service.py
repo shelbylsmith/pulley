@@ -18,9 +18,11 @@ from src.db.queries import (
     delete_message_mapping,
     get_github_username_map_for_slack_ids,
     get_message_mapping_by_github_comment,
-    get_message_mapping_by_slack_ts,
+    get_message_mapping_in_channel,
     get_org,
     get_pr_by_channel,
+    get_pr_by_channel_thread,
+    get_pr_by_id,
     get_pr_by_repo_and_number,
     get_slack_ids_for_github_usernames,
     get_thread_mapping,
@@ -152,7 +154,7 @@ async def handle_pr_review(payload: dict) -> None:
     message = _render_review_message(state, review_url, repo, pr_number, body_slack)
 
     ts_list = await _post_attributed_to_github_user(
-        db_pr.slack_channel_id, message, reviewer, token
+        db_pr.slack_channel_id, message, reviewer, token, thread_ts=db_pr.slack_thread_ts
     )
     if ts_list:
         await create_message_mapping(
@@ -165,7 +167,10 @@ async def handle_pr_review(payload: dict) -> None:
             slack_ts_extra=ts_list[1:],
         )
         if settings.collapse_review_comments and body and org:
-            await _post_review_comments_in_thread(db_pr, org, review, ts_list[0], token)
+            # A stacked PR's review is already a reply, and Slack threads do not
+            # nest, so its comments go in the PR's own thread.
+            thread_ts = db_pr.slack_thread_ts or ts_list[0]
+            await _post_review_comments_in_thread(db_pr, org, review, thread_ts, token)
 
     # Update the org-level digest with the new review state
 
@@ -280,7 +285,9 @@ async def handle_pr_review_dismissed(payload: dict) -> None:
     message = (
         f"🚫 *{dismisser}* dismissed *{reviewer}*'s review on <{review_url}|{repo}#{pr_number}>"
     )
-    await slack_service.post_message(db_pr.slack_channel_id, message, token=token)
+    await slack_service.post_message(
+        db_pr.slack_channel_id, message, thread_ts=db_pr.slack_thread_ts, token=token
+    )
 
     await set_pr_last_review_state(db_pr.github_pr_id, None)
     if org:
@@ -349,7 +356,7 @@ async def handle_review_comment(payload: dict) -> None:
         message = _render_review_comment_message(comment, body_slack)
 
         ts_list = await _post_attributed_to_github_user(
-            db_pr.slack_channel_id, message, author, token
+            db_pr.slack_channel_id, message, author, token, thread_ts=db_pr.slack_thread_ts
         )
 
         if ts_list:
@@ -357,7 +364,9 @@ async def handle_review_comment(payload: dict) -> None:
                 pull_request_id=db_pr.id,
                 github_thread_id=github_thread_id,
                 slack_channel_id=db_pr.slack_channel_id,
-                slack_thread_ts=ts_list[0],
+                # Slack threads do not nest: a stacked PR's comment threads all
+                # continue in the PR's own thread.
+                slack_thread_ts=db_pr.slack_thread_ts or ts_list[0],
                 file_path=path,
             )
 
@@ -411,7 +420,9 @@ async def handle_review_thread(payload: dict, action: str) -> None:
     if path:
         message += f" on `{path}`"
 
-    await slack_service.post_message(db_pr.slack_channel_id, message, token=token)
+    await slack_service.post_message(
+        db_pr.slack_channel_id, message, thread_ts=db_pr.slack_thread_ts, token=token
+    )
     logger.info("Review thread %s by %s on %s#%d", verb, resolver, repo, pr_number)
 
 
@@ -440,7 +451,9 @@ async def handle_issue_comment(payload: dict) -> None:
 
     body_slack = await github_body_to_slack(body)
     message = _render_issue_comment_message(comment_url, repo, issue_number, body_slack)
-    ts_list = await _post_attributed_to_github_user(db_pr.slack_channel_id, message, author, token)
+    ts_list = await _post_attributed_to_github_user(
+        db_pr.slack_channel_id, message, author, token, thread_ts=db_pr.slack_thread_ts
+    )
     if ts_list:
         await create_message_mapping(
             pull_request_id=db_pr.id,
@@ -623,7 +636,10 @@ async def handle_slack_message(
     if text.startswith(SLACK_SYNC_PREFIX):
         return
 
-    db_pr = await get_pr_by_channel(channel_id)
+    # A reply under a stacked PR's parent message belongs to that PR; anything
+    # else in the channel belongs to the PR that owns the channel.
+    stacked = await get_pr_by_channel_thread(channel_id, thread_ts) if thread_ts else None
+    db_pr = stacked or await get_pr_by_channel(channel_id)
     if not db_pr:
         return
 
@@ -641,7 +657,7 @@ async def handle_slack_message(
         # a GitHub review thread, reply there instead of creating a new
         # top-level comment.
         mapping = None
-        if thread_ts:
+        if thread_ts and not stacked:
             mapping = await get_thread_mapping_by_slack_ts(db_pr.id, thread_ts)
 
         if mapping:
@@ -732,12 +748,13 @@ async def handle_slack_message_edited(
     if text.startswith(SLACK_SYNC_PREFIX):
         return
 
-    db_pr = await get_pr_by_channel(channel_id)
-    if not db_pr:
-        return
-
-    mapping = await get_message_mapping_by_slack_ts(db_pr.id, message_ts)
+    # Look the message up across the channel: in a stack's channel it may
+    # belong to a stacked PR rather than the channel's owner.
+    mapping = await get_message_mapping_in_channel(channel_id, message_ts)
     if not mapping or mapping.origin != "slack":
+        return
+    db_pr = await get_pr_by_id(mapping.pull_request_id)
+    if not db_pr:
         return
 
     org = await get_org(db_pr.organization_id)
@@ -773,12 +790,13 @@ async def handle_slack_message_edited(
 
 async def handle_slack_message_deleted(channel_id: str, message_ts: str) -> None:
     """Mirror a deletion of a Slack message onto the GitHub comment it created."""
-    db_pr = await get_pr_by_channel(channel_id)
-    if not db_pr:
-        return
-
-    mapping = await get_message_mapping_by_slack_ts(db_pr.id, message_ts)
+    # Look the message up across the channel: in a stack's channel it may
+    # belong to a stacked PR rather than the channel's owner.
+    mapping = await get_message_mapping_in_channel(channel_id, message_ts)
     if not mapping or mapping.origin != "slack":
+        return
+    db_pr = await get_pr_by_id(mapping.pull_request_id)
+    if not db_pr:
         return
 
     org = await get_org(db_pr.organization_id)
